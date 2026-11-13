@@ -137,6 +137,22 @@ public class SomaMod {
         );
     }
 
+    /**
+     * The agent's body. A named subclass (not an anonymous one) so that it can
+     * expose the protected LivingEntity.attackStrengthTicker - the Agent class
+     * has no business touching a protected field of another class.
+     */
+    static final class SomaPlayer extends FakePlayer {
+        SomaPlayer(ServerLevel level, GameProfile profile) { super(level, profile); }
+        @Override public boolean isInvulnerableTo(net.minecraft.world.damagesource.DamageSource d) { return false; }
+        @Override public boolean isInvulnerable() { return false; }
+        @Override public void tick() { /* driven by Agent.tick() */ }
+        @Override public boolean isSpectator() { return false; }
+        @Override public boolean isInvisible() { return false; }
+        @Override public boolean canBeSeenAsEnemy() { return isAlive(); }
+        public void bumpAttackCooldown() { this.attackStrengthTicker++; }
+    }
+
     // =====================================================================
     //  Agent
     // =====================================================================
@@ -155,7 +171,7 @@ public class SomaMod {
 
         final MinecraftServer server;
         ServerLevel level;
-        FakePlayer player;
+        SomaPlayer player;
 
         final AtomicBoolean enabled = new AtomicBoolean(false);
         final AtomicBoolean running = new AtomicBoolean(false);
@@ -339,17 +355,7 @@ public class SomaMod {
             if (level == null) level = server.getLevel(net.minecraft.world.level.Level.OVERWORLD);
             if (player == null && level != null) {
                 GameProfile profile = new GameProfile(UUID.fromString("6dded40e-b7fe-3867-86cf-20f080f1c988"), "SOMA");
-                player = new FakePlayer(level, profile) {
-                    @Override public boolean isInvulnerableTo(net.minecraft.world.damagesource.DamageSource d) { return false; }
-                    @Override public boolean isInvulnerable() { return false; }
-                    @Override public void tick() { /* driven by Agent.tick() */ }
-                    /** attackStrengthTicker is protected in LivingEntity; a subclass may
-                     *  touch its own instance, the Agent class may not. */
-                    public void bumpAttackCooldown() { this.attackStrengthTicker++; }
-                    @Override public boolean isSpectator() { return false; }
-                    @Override public boolean isInvisible() { return false; }
-                    @Override public boolean canBeSeenAsEnemy() { return isAlive(); }
-                };
+                player = new SomaPlayer(level, profile);
                 BlockPos spawn = level.getSharedSpawnPos();
                 player.setPos(spawn.getX() + 0.5, findGroundY(spawn.getX(), spawn.getZ()), spawn.getZ() + 0.5);
                 setSurvival();
