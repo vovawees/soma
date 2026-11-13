@@ -1,0 +1,11 @@
+node_modules/
+.venv/
+data/
+*.log
+__pycache__/
+*.pyc
+*.npz
+*.npz.tmp*
+replay.f16
+replay.f16.hdr
+.DS_Store

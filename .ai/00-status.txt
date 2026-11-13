@@ -1,0 +1,82 @@
+SOMA — TECHNICAL BASE (read this first, together with GitHub Issues)
+
+WHAT IT IS
+Compact self-learning Minecraft agent. One world, one agent, no parallel worlds.
+Decision model ~3.4M params (target budget 10M), vector observations, no images,
+no LLM in the game loop. Reward = multi-signal. Replay buffer on disk.
+Spec source: idea.txt on the user's desktop (desktop file, not in repo).
+
+REPO LAYOUT
+soma/
+  bot/            environment adapter (Node + mineflayer). Transport only.
+  agent/          brain (inference + reward + buffer) and trainer (SGD).
+  scripts/soma.sh start/stop/status for bot, brain, trainer (tmux soma_*).
+  data/           model.npz, replay.f16, metrics.jsonl, logs (gitignored).
+
+PROCESSES / PORTS / PATHS ON THE VPS
+project dir      /home/opc/ai_workspace/soma
+tmux sessions    soma_bot, soma_brain, soma_trainer
+IPC              TCP 127.0.0.1:8787 (bot -> brain, newline JSON)
+replay file      data/replay.f16 (+ .hdr), 19185 bytes per record
+venv             /home/opc/ai_workspace/soma/.venv  (python3.9, numpy<2)
+MC server        /home/opc/ai_workspace/create-aeronautics-server
+                 tmux create_aeronautics_server, NeoForge 21.1.265 (MC 1.21.1)
+                 java @user_jvm_args.txt, -Xms6G -Xmx8G
+
+HARDWARE
+VPS: Oracle Cloud aarch64 (Ampere A1), 4 OCPU, 24 GB, Java 21, Node 24, py3.9.
+     NEON only, NO AVX2. No docker/podman. firewalld + OCI SL: only 22/tcp.
+     tailscale is up (100.83.245.109) - use it for the game client, do not open 25565.
+local PC: i5-6500, 4C/4T, AVX2, 15 GB.
+
+PROTOCOL (bot <-> brain), schema v1
+frame -> flat float32 vector, 3450 dims:
+  self 32 | grid 512*6 | ent 12*10 | inv 41*4 | ev 10*5 | meta 12
+all values relative to the player, rotated into the player's frame
+(translation + rotation invariant). Categorical ids go through FIXED hashed
+embeddings (4096 blocks, 2048 items, 1024 entity names) - mods cannot shift the
+feature space.
+candidate = one admissible action (mine/goto/attack/use/place/equip/eat/drop/
+jump/wait/stop). Bot advertises <=48 candidates, brain answers with an INDEX.
+
+MODEL (agent/model.py)
+encoder 3450->768->192 | temporal 6*192->384->192 |
+Q head (192+16)->128->1 per candidate | V head | aux dynamics head
+3,428,097 params, fp32, ~14 MB. Encoder is trained ONLY by the auxiliary loss
+(predict next latent); the RL loss uses detached latents. Trainer publishes
+model.npz.tmp.<pid> + os.replace; brain reloads on mtime.
+
+REWARD (agent/reward.py)
+new block/item type, new chunk (novelty, log-damped), damage, death (-3),
+idle, time cost (-0.005/step), all clipped to +-3.
+
+STATUS / BLOCKER (2026-11-13)
+- MC server: started, "Done" in log, healthy. IT IS RUNNING.
+- Python core: smoke test passes (agent/smoke.py) - encoding, model, backward,
+  replay round-trip, aux loss 0.42 -> 0.0000.
+- bot/: connects, but NeoForge 21.1.265 rejects vanilla clients at the
+  configuration phase:
+    "neoforge.network.negotiation.failure.vanilla.client.not_supported"
+  Evidence: probes bot/probe*.js (deleted from repo). The server sends
+  minecraft:register (38 channels) then neoforge:register (empty) and kicks.
+  Replying on minecraft:register = still rejected. Replying on neoforge:register
+  with an empty list = "multiplayer.disconnect.incompatible" (negotiation runs,
+  but the bot has no channels). Any non-empty guess = decoder exception on the
+  server, so the exact payload format is unknown.
+- No "allow vanilla clients" option exists in NeoForge 21.1 (checked
+  neoforge-server.toml, fml.toml, NetworkRegistry strings, NeoForgeConfig$Server).
+
+NEXT STEP OPTIONS (needs user decision)
+A) server-side companion mod (NeoForge 21.1.265, Java 21, fake player). Works on
+   this server, matches idea.txt section 4A. Needs: JDK devel + ModDevGradle
+   build (~15 min on ARM), jar into mods/, server restart.
+B) keep the mineflayer bot, run it against a vanilla 1.21.1 server (works today,
+   portable to any vanilla server - which is what the user said matters).
+C) keep reverse-engineering the neoforge:register payload (unbounded effort,
+   and even if it connects, the server will try to sync 248 mods' registries).
+
+REDO / BUILD
+python3 -m venv .venv && .venv/bin/pip install -r agent/requirements.txt
+cd bot && npm install
+./scripts/soma.sh all      # bot + brain + trainer
+./scripts/stats.sh         # telemetry
