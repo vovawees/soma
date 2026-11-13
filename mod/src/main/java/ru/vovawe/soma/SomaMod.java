@@ -4,21 +4,50 @@ import com.google.gson.Gson;
 import com.mojang.authlib.GameProfile;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.Connection;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.MoverType;
+import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.item.ArmorItem;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.DiggerItem;
+import net.minecraft.world.item.Equipable;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.SwordItem;
+import net.minecraft.world.item.TieredItem;
+import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.ButtonBlock;
+import net.minecraft.world.level.block.CraftingTableBlock;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.FurnaceBlock;
+import net.minecraft.world.level.block.LeverBlock;
+import net.minecraft.world.level.block.TrapDoorBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
@@ -42,6 +71,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -52,14 +82,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * SOMA environment adapter, server side.
+ * SOMA environment adapter v2 (NeoForge 1.21.1).
  *
- * The agent is a REAL ServerPlayer: it is in the tab list, mobs target it and
- * it picks up drops natively. It receives numeric frames over TCP, answers with
- * the index of the candidate it wants executed, and never executes anything the
- * brain did not ask for.
- *
- * No policy, no reward shaping, no strategy. Same wire schema as bot/ (Node).
+ * Full real survival (damage, drowning, hunger, fire, armor, pickups, death/respawn),
+ * universal modpack support (dynamic RecipeManager crafting, MenuProvider/BlockEntity
+ * interaction, modded entity & item classification), dense 1-block local voxel grid,
+ * interruptible A* movement, and high-speed cached observation streaming.
  */
 @Mod("soma")
 public class SomaMod {
@@ -72,7 +100,7 @@ public class SomaMod {
         NeoForge.EVENT_BUS.addListener(this::onServerTick);
         NeoForge.EVENT_BUS.addListener(this::onServerStopping);
         NeoForge.EVENT_BUS.addListener(this::onRegisterCommands);
-        System.out.println("[soma] mod constructed");
+        System.out.println("[soma] mod v2 constructed");
     }
 
     private void onServerStarted(ServerStartedEvent ev) {
@@ -103,10 +131,9 @@ public class SomaMod {
                 .then(net.minecraft.commands.Commands.literal("spawnmob")
                     .executes(c -> { if (agent != null) agent.spawnTestMob(); return 1; }))
                 .then(net.minecraft.commands.Commands.literal("hurt")
-                    .executes(c -> { if (agent != null) agent.debugHurt(3); return 1; }))
+                    .executes(c -> { if (agent != null) agent.debugHurt(4.0f); return 1; }))
                 .then(net.minecraft.commands.Commands.literal("cleanup")
-                    .executes(c -> { if (agent != null) agent.cleanupStands(true);
-                                     return 1; }))
+                    .executes(c -> { if (agent != null) agent.cleanupStands(true); return 1; }))
         );
     }
 
@@ -115,12 +142,12 @@ public class SomaMod {
     // =====================================================================
     static final class Agent {
         static final int GRID_N = 8;
-        static final int GRID_STEP = 2;
+        static final int GRID_STEP = 1;
         static final int GRID_CELLS = GRID_N * GRID_N * GRID_N;
         static final int MAX_CAND = 48;
-        static final int MAX_ENT = 12;
+        static final int MAX_ENT = 16;
         static final int EV_MAX = 10;
-        static final int OBS_TICKS = 6;
+        static final int OBS_TICKS = 4;   // 5 Hz decision rate
 
         static final double REACH = 4.5;
         static final String HOST = "127.0.0.1";
@@ -133,6 +160,7 @@ public class SomaMod {
         final AtomicBoolean enabled = new AtomicBoolean(false);
         final AtomicBoolean running = new AtomicBoolean(false);
         final AtomicReference<String> lastError = new AtomicReference<>("not started");
+        final AtomicReference<Thread> netThread = new AtomicReference<>();
 
         ServerSocket serverSocket;
         volatile PrintWriter out;
@@ -154,30 +182,34 @@ public class SomaMod {
         boolean activeOk = true;
 
         final List<Map<String, Object>> events = new ArrayList<>();
-        final Map<Integer, String> blockNames = new HashMap<>();
         List<Map<String, Object>> candidates = new ArrayList<>();
-        final java.util.Map<Integer, List<Map<String, Object>>> candBySeq = new java.util.LinkedHashMap<>();
+        final Map<Integer, List<Map<String, Object>>> candBySeq = new LinkedHashMap<>();
+        final Map<String, RecipeHolder<CraftingRecipe>> craftableById = new HashMap<>();
+
         int lastPosTick = 0;
         double lastMoveX = 0, lastMoveZ = 0;
 
         BlockPos miningPos = null;
-        Direction miningDir = Direction.UP;
         int miningTicks = 0;
         float miningProgress = 0.0f;
+
         double fallStartY = -1.0;
-        double lastHp = 20.0;
-        int hungerTick = 0;
-        int regenTick = 0;
+        float lastHp = 20.0f;
+        int lastFood = 20;
+        int lavaTick = 0;
+        int drownTick = 0;
+        int suffocateTick = 0;
 
         int lastAttackedId = -1;
         String lastAttackedName = "";
-        final Map<Integer, String> savedInventory = new HashMap<>();
+        String lastMobInfo = "";
 
-        // chunk cache
-        net.minecraft.world.level.chunk.LevelChunk curChunk = null;
-        int curCX = Integer.MIN_VALUE, curCZ = Integer.MIN_VALUE;
+        // 3x3 Chunk cache
+        final net.minecraft.world.level.chunk.LevelChunk[] chunkCache = new net.minecraft.world.level.chunk.LevelChunk[9];
+        int cacheCX = Integer.MIN_VALUE, cacheCZ = Integer.MIN_VALUE;
         int gridFallbacks = 0;
-        final int[] gridCache = new int[GRID_CELLS];
+        final int[] gridIds = new int[GRID_CELLS];
+        final int[] gridFlags = new int[GRID_CELLS];
 
         Agent(MinecraftServer server) { this.server = server; }
 
@@ -193,8 +225,6 @@ public class SomaMod {
             System.out.println("[soma] agent thread started, ipc " + HOST + ":" + PORT);
         }
 
-        final AtomicReference<Thread> netThread = new AtomicReference<>();
-
         void stop() {
             running.set(false);
             try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
@@ -209,50 +239,42 @@ public class SomaMod {
                     + " seq=" + seq + " actions=" + actionCount
                     + " pos=" + (player == null ? "-" : String.format(Locale.ROOT, "%.0f,%.0f,%.0f",
                         player.getX(), player.getY(), player.getZ()))
-                    + " hp=" + (player == null ? 0 : (int) player.getHealth())
+                    + " hp=" + (player == null ? 0 : String.format(Locale.ROOT, "%.1f", player.getHealth()))
                     + " food=" + (player == null ? 0 : player.getFoodData().getFoodLevel())
+                    + " air=" + (player == null ? 0 : player.getAirSupply())
                     + " inv=" + (player == null ? 0 : countItems())
                     + " gm=" + (player == null ? "-" : player.gameMode.getGameModeForPlayer())
-                    + " fly=" + (player == null ? "-" : (player.getAbilities().mayfly + "/" + player.getAbilities().flying))
-                    + " spec=" + (player == null ? "-" : player.isSpectator())
                     + " mobs=" + (player == null ? 0 : countHostiles())
-                    + " inLevel=" + (player != null && level.players().contains(player))
-                    + " players=" + server.getPlayerList().getPlayers().size()
-                    + " inTab=" + server.getPlayerList().getPlayers().contains(player)
-                    + " mobs: " + lastMobInfo
+                    + " inTab=" + (player != null && server.getPlayerList().getPlayers().contains(player))
                     + " errors=" + errorCount + " lastError=" + lastError.get()), true);
         }
 
-        /** Debug: drop a zombie next to the agent so the damage path can be verified. */
         void spawnTestMob() {
+            if (player == null || level == null) return;
             try {
-                net.minecraft.world.entity.Mob m = net.minecraft.world.entity.EntityType.ZOMBIE.create(level);
+                Mob m = net.minecraft.world.entity.EntityType.ZOMBIE.create(level);
                 m.moveTo(player.getX() + 2.0, player.getY(), player.getZ());
                 level.addFreshEntity(m);
-                System.out.println("[soma] test zombie spawned at " + m.getX() + "," + m.getY() + "," + m.getZ()
-                    + " agentInvulnerable=" + player.isInvulnerable());
             } catch (Throwable e) {
                 System.out.println("[soma] spawn failed: " + e);
             }
         }
 
-        /** Debug: apply damage to the agent so the damage path can be verified. */
         void debugHurt(float amount) {
-            if (player == null) return;
-            float before = player.getHealth();
-            player.setHealth(Math.max(0.5f, before - amount));
-            pushEvent("debug_hurt", (int) amount, null);
-            System.out.println("[soma] debug hurt " + before + " -> " + player.getHealth());
+            if (player == null || level == null) return;
+            player.invulnerableTime = 0;
+            boolean ok = player.hurt(level.damageSources().generic(), amount);
+            System.out.println("[soma] debug hurt ok=" + ok + " hp=" + player.getHealth());
         }
 
         int countHostiles() {
             try {
                 AABB a = player.getBoundingBox().inflate(16.0);
                 List<Entity> l = level.getEntitiesOfClass(Entity.class, a,
-                    e -> e != player && e.isAlive() && e instanceof Enemy);
+                    e -> e != player && e.isAlive() && isHostile(e));
                 StringBuilder sb = new StringBuilder();
                 for (Entity e : l) {
-                    Entity tgt = (e instanceof net.minecraft.world.entity.Mob m) ? m.getTarget() : null;
+                    Entity tgt = (e instanceof Mob m) ? m.getTarget() : null;
                     sb.append(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()))
                       .append("->").append(tgt == player ? "SOMA" : (tgt == null ? "none" : "other"))
                       .append(' ');
@@ -261,8 +283,6 @@ public class SomaMod {
                 return l.size();
             } catch (Throwable e) { return -1; }
         }
-
-        String lastMobInfo = "";
 
         int countItems() {
             try {
@@ -287,7 +307,7 @@ public class SomaMod {
                         in = new BufferedReader(new InputStreamReader(s.getInputStream()));
                         out = new PrintWriter(s.getOutputStream(), true);
                         System.out.println("[soma] brain connected");
-                        lastError.set("not started");
+                        lastError.set("connected");
                         String line;
                         while (running.get() && (line = in.readLine()) != null) {
                             line = line.trim();
@@ -309,7 +329,6 @@ public class SomaMod {
                     }
                 } catch (Throwable e) {
                     lastError.set(String.valueOf(e));
-                    System.out.println("[soma] net error: " + e);
                     try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                 }
             }
@@ -323,28 +342,25 @@ public class SomaMod {
                 player = new FakePlayer(level, profile) {
                     @Override public boolean isInvulnerableTo(net.minecraft.world.damagesource.DamageSource d) { return false; }
                     @Override public boolean isInvulnerable() { return false; }
-                    @Override public void tick() { /* driven by the agent */ }
+                    @Override public void tick() { /* driven by Agent.tick() */ }
                     @Override public boolean isSpectator() { return false; }
                     @Override public boolean isInvisible() { return false; }
+                    @Override public boolean canBeSeenAsEnemy() { return isAlive(); }
                 };
                 BlockPos spawn = level.getSharedSpawnPos();
-                player.setPos(spawn.getX() + 0.5, findGroundY(spawn.getX(), spawn.getZ()) + 1.0, spawn.getZ() + 0.5);
+                player.setPos(spawn.getX() + 0.5, findGroundY(spawn.getX(), spawn.getZ()), spawn.getZ() + 0.5);
                 setSurvival();
                 attachToServer();
-                // AFTER placeNewPlayer: it reloads the player NBT from disk and wipes
-                // anything we put in the inventory before that
-                giveStarterKit();
-                try {
-                    player.getFoodData().setFoodLevel(20);
-                    player.getFoodData().setSaturation(5.0f);
-                } catch (Throwable ignored) {}
-                System.out.println("[soma] fake player created at " + player.getX() + "," + player.getY()
+                player.invulnerableTime = 0;
+                giveStarterKitIfEmpty();
+                lastHp = player.getHealth();
+                lastFood = player.getFoodData().getFoodLevel();
+                System.out.println("[soma] player ready at " + player.getX() + "," + player.getY()
                     + "," + player.getZ() + " visible=" + playerVisible);
             }
             if (player != null && player.isRemoved()) { player = null; playerVisible = false; }
         }
 
-        /** Full survival: no flight, no creative invulnerability, no instant break. */
         void setSurvival() {
             try { player.setGameMode(GameType.SURVIVAL); } catch (Throwable ignored) {}
             try {
@@ -352,25 +368,24 @@ public class SomaMod {
                 player.getAbilities().mayfly = false;
                 player.getAbilities().flying = false;
                 player.getAbilities().invulnerable = false;
-                // Entity.setInvulnerable() is a DIFFERENT flag from Abilities.invulnerable
-                // and it is checked before isInvulnerableTo() -> this is what silently
-                // ate every point of damage
                 player.setInvulnerable(false);
             } catch (Throwable ignored) {}
         }
 
-        /** Bootstrap: without a tool and food the agent cannot survive (and cannot craft). */
-        void giveStarterKit() {
+        void giveStarterKitIfEmpty() {
             try {
                 Inventory inv = player.getInventory();
-                inv.setItem(0, new ItemStack(net.minecraft.world.item.Items.WOODEN_PICKAXE));
-                inv.setItem(1, new ItemStack(net.minecraft.world.item.Items.BREAD, 3));
-                inv.setItem(2, new ItemStack(net.minecraft.world.item.Items.TORCH, 8));
-                inv.selected = 0;
-                System.out.println("[soma] starter kit given");
-            } catch (Throwable e) {
-                System.out.println("[soma] starter kit failed: " + e);
-            }
+                boolean empty = true;
+                for (int i = 0; i < inv.getContainerSize(); i++) {
+                    if (!inv.getItem(i).isEmpty()) { empty = false; break; }
+                }
+                if (empty) {
+                    inv.setItem(0, new ItemStack(net.minecraft.world.item.Items.WOODEN_PICKAXE));
+                    inv.setItem(1, new ItemStack(net.minecraft.world.item.Items.BREAD, 3));
+                    inv.setItem(2, new ItemStack(net.minecraft.world.item.Items.TORCH, 8));
+                    inv.selected = 0;
+                }
+            } catch (Throwable ignored) {}
         }
 
         void attachToServer() {
@@ -398,18 +413,15 @@ public class SomaMod {
                 server.getPlayerList().placeNewPlayer(conn, player, cookie);
                 playerVisible = true;
                 setSurvival();
-                System.out.println("[soma] attached -> tab entry, mob aggro, native pickups");
                 return;
             } catch (Throwable e) {
-                System.out.println("[soma] placeNewPlayer failed (" + e + "), world-only player");
+                System.out.println("[soma] placeNewPlayer failed (" + e + "), world-only fallback");
             }
             try {
                 level.addNewPlayer(player);
                 playerVisible = true;
-                System.out.println("[soma] world player registered (no tab entry)");
             } catch (Throwable e2) {
                 playerVisible = false;
-                System.out.println("[soma] attach failed: " + e2);
             }
         }
 
@@ -436,56 +448,81 @@ public class SomaMod {
                 for (net.minecraft.network.ConnectionProtocol proto : net.minecraft.network.ConnectionProtocol.values()) {
                     m.computeIfAbsent(proto, k -> new java.util.HashSet<>()).addAll(all);
                 }
-                System.out.println("[soma] claimed " + all.size() + " mod channels");
             } catch (Throwable e) {
-                System.out.println("[soma] channel registration failed: " + e);
+                System.out.println("[soma] channel registration warning: " + e);
             }
         }
 
-        // ----------------------------------------------------------- health --
-        void checkHealth() {
+        // ----------------------------------------------------------- survival --
+        void handleDeathAndRespawn() {
             if (player == null) return;
+            if (player.getHealth() > 0.0f && !player.isDeadOrDying()) return;
+
+            pushEvent("death", 1, player.blockPosition());
+            boolean keepInv = false;
+            try { keepInv = level.getGameRules().getBoolean(GameRules.RULE_KEEPINVENTORY); } catch (Throwable ignored) {}
+            if (!keepInv) {
+                try { player.getInventory().dropAll(); } catch (Throwable ignored) {}
+            }
+            try { player.removeAllEffects(); } catch (Throwable ignored) {}
+            player.setHealth(player.getMaxHealth());
+            player.getFoodData().setFoodLevel(20);
+            player.getFoodData().setSaturation(5.0f);
+            player.setAirSupply(player.getMaxAirSupply());
+            player.clearFire();
+            player.invulnerableTime = 20;
+            fallStartY = -1.0;
+            miningPos = null;
+            route.clear();
+            finish(false, "died");
+
+            BlockPos sp = player.getRespawnPosition();
+            if (sp == null) sp = level.getSharedSpawnPos();
+            player.setPos(sp.getX() + 0.5, findGroundY(sp.getX(), sp.getZ()), sp.getZ() + 0.5);
+            player.setDeltaMovement(0, 0, 0);
+            lastHp = player.getHealth();
+            System.out.println("[soma] agent died -> respawned at " + sp);
+        }
+
+        void pickupNearbyItems() {
+            if (player == null || level == null) return;
             try {
-                player.setAirSupply(player.getMaxAirSupply());
-                if (player.getHealth() > 0.5f) { snapshotInventory(); return; }
-                pushEvent("death", 1, null);
-                player.setHealth(player.getMaxHealth());
-                try { player.getFoodData().setFoodLevel(20); player.getFoodData().setSaturation(5.0f); } catch (Throwable ignored) {}
-                restoreInventory();
-                BlockPos sp = level.getSharedSpawnPos();
-                player.setPos(sp.getX() + 0.5, findGroundY(sp.getX(), sp.getZ()) + 1.0, sp.getZ() + 0.5);
-                player.setDeltaMovement(0, 0, 0);
-                System.out.println("[soma] agent died, respawned at spawn");
-            } catch (Throwable e) {
-                try { player.setHealth(player.getMaxHealth()); } catch (Throwable ignored) {}
-            }
-        }
-
-        void snapshotInventory() {
-            savedInventory.clear();
-            Inventory inv = player.getInventory();
-            for (int i = 0; i < inv.getContainerSize(); i++) {
-                ItemStack st = inv.getItem(i);
-                if (!st.isEmpty()) {
-                    savedInventory.put(i, BuiltInRegistries.ITEM.getKey(st.getItem()).toString());
+                AABB box = player.getBoundingBox().inflate(1.2, 0.7, 1.2);
+                List<ItemEntity> items = level.getEntitiesOfClass(ItemEntity.class, box,
+                    ie -> ie.isAlive() && !ie.hasPickUpDelay());
+                for (ItemEntity ie : items) {
+                    ItemStack st = ie.getItem();
+                    if (st.isEmpty()) continue;
+                    String nm = BuiltInRegistries.ITEM.getKey(st.getItem()).toString();
+                    int before = st.getCount();
+                    ie.playerTouch(player);
+                    int after = ie.isRemoved() ? 0 : ie.getItem().getCount();
+                    if (after < before) {
+                        pushEvent("pickup", before - after, ie.blockPosition(), nm);
+                        autoEquipArmor(st);
+                    }
                 }
-            }
+            } catch (Throwable ignored) {}
         }
 
-        void restoreInventory() {
-            Inventory inv = player.getInventory();
-            inv.clearContent();
-            for (Map.Entry<Integer, String> e : savedInventory.entrySet()) {
-                Item item = BuiltInRegistries.ITEM.get(
-                    net.minecraft.resources.ResourceLocation.tryParse(e.getValue()));
-                if (item == null || item == Items_AIR()) continue;
-                inv.setItem(e.getKey(), new ItemStack(item, 1));
-            }
+        void autoEquipArmor(ItemStack picked) {
+            try {
+                Inventory inv = player.getInventory();
+                for (int i = 0; i < 36; i++) {
+                    ItemStack st = inv.getItem(i);
+                    if (st.isEmpty()) continue;
+                    if (st.getItem() instanceof ArmorItem armor) {
+                        int slotIdx = armor.getEquipmentSlot().getIndex();
+                        ItemStack cur = inv.armor.get(slotIdx);
+                        if (cur.isEmpty()) {
+                            inv.armor.set(slotIdx, st.copy());
+                            inv.setItem(i, ItemStack.EMPTY);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
         }
 
-        static Item Items_AIR() { return net.minecraft.world.item.Items.AIR; }
-
-        // ------------------------------------------------------- stand cleanup --
         void cleanupStands() { cleanupStands(false); }
 
         void cleanupStands(boolean verbose) {
@@ -495,17 +532,13 @@ public class SomaMod {
                 AABB box = new AABB(-3000, -64, -3000, 3000, 320, 3000);
                 List<net.minecraft.world.entity.decoration.ArmorStand> stands =
                     level.getEntitiesOfClass(net.minecraft.world.entity.decoration.ArmorStand.class, box);
-                int total = stands.size();
                 int mine = 0;
                 for (net.minecraft.world.entity.decoration.ArmorStand st : stands) {
                     Component n = st.getCustomName();
                     if (n != null && "SOMA".equals(n.getString())) { st.discard(); mine++; }
                 }
                 cleaned = mine;
-                System.out.println("[soma] armour stands: " + total + " total, " + mine + " SOMA ones removed");
-            } catch (Throwable e) {
-                System.out.println("[soma] stand cleanup failed: " + e);
-            }
+            } catch (Throwable ignored) {}
         }
 
         // -------------------------------------------------------------- tick --
@@ -515,19 +548,24 @@ public class SomaMod {
                 ensurePlayer();
                 if (player == null) return;
                 if (cleaned < 0) cleanupStands();
-                else if (tickCounter % 600 == 0) cleanupStands(true);
-                // The entity has to tick like a real one: Entity.isRemovedOrRecentlyCreated()
-                // is tickCount == 0, and LivingEntity.hurt() rejects damage on a
-                // "recently created" entity. FakePlayer.tick() is empty, so we drive it.
+                else if (tickCounter % 1200 == 0) cleanupStands(false);
+
+                // Drive core entity & player ticks
                 int tcBefore = player.tickCount;
                 try { player.baseTick(); } catch (Throwable ignored) {}
                 if (player.tickCount <= tcBefore) player.tickCount = tcBefore + 1;
-                checkHealth();
+                try { player.getFoodData().tick(player); } catch (Throwable ignored) {}
+                try { player.attackStrengthTicker++; } catch (Throwable ignored) {}
+
                 survivalTick();
+                handleDeathAndRespawn();
+                pickupNearbyItems();
                 advanceMining();
+
                 if (warmup > 0) { warmup--; return; }
                 tickCounter++;
                 driveActive();
+
                 if (tickCounter % OBS_TICKS != 0) return;
                 sendObservation();
                 pollAndExecute();
@@ -537,102 +575,158 @@ public class SomaMod {
             }
         }
 
-        /**
-         * Survival rules the vanilla player tick would normally apply. FakePlayer.tick()
-         * is empty, so we drive hunger, regeneration and environmental damage here.
-         */
         void survivalTick() {
             if (player == null) return;
             try {
-                // fall damage - tracked by hand: Entity.fallDistance only moves in
-                // LivingEntity.travel(), which a FakePlayer never runs
-                if (!player.onGround()) {
+                // Fall damage via real DamageSource
+                if (!player.onGround() && !inWater() && !player.isInLava()) {
                     if (fallStartY < 0) fallStartY = player.getY();
                     else fallStartY = Math.max(fallStartY, player.getY());
                 } else if (fallStartY >= 0) {
                     double drop = fallStartY - player.getY();
                     fallStartY = -1.0;
-                    if (drop > 3.0) {
+                    if (drop > 3.0 && !inWater()) {
                         float dmg = (float) (drop - 3.0);
-                        player.setHealth(Math.max(0.5f, player.getHealth() - dmg));
-                        pushEvent("fall", (int) Math.round(dmg), null);
-                        System.out.println("[soma] fall damage " + Math.round(dmg));
+                        player.hurt(level.damageSources().fall(), dmg);
+                        pushEvent("fall", (int) Math.round(dmg), player.blockPosition());
                     }
                 }
 
-                // report any health change so we can see where damage comes from
+                // Lava & Fire
+                if (player.isInLava()) {
+                    player.setRemainingFireTicks(300);
+                    if (++lavaTick % 10 == 0) {
+                        player.hurt(level.damageSources().lava(), 4.0f);
+                        pushEvent("burn", 4, player.blockPosition());
+                    }
+                } else {
+                    lavaTick = 0;
+                }
+
+                // Drowning (real air supply!)
+                BlockPos eyePos = BlockPos.containing(player.getX(), player.getEyeY(), player.getZ());
+                boolean eyeInWater = level.getFluidState(eyePos).is(FluidTags.WATER);
+                if (eyeInWater) {
+                    int air = player.getAirSupply() - 1;
+                    player.setAirSupply(air);
+                    if (air <= -20) {
+                        player.setAirSupply(0);
+                        player.hurt(level.damageSources().drown(), 2.0f);
+                        pushEvent("drown", 2, eyePos);
+                    }
+                } else {
+                    player.setAirSupply(Math.min(player.getMaxAirSupply(), player.getAirSupply() + 4));
+                }
+
+                // Suffocation in solid block
+                BlockState eyeState = bs(eyePos);
+                if (eyeState != null && eyeState.isSuffocating(level, eyePos)) {
+                    if (++suffocateTick % 20 == 0) {
+                        player.hurt(level.damageSources().inWall(), 1.0f);
+                    }
+                } else {
+                    suffocateTick = 0;
+                }
+
+                // Void damage
+                if (player.getY() < level.getMinBuildHeight() - 32) {
+                    player.hurt(level.damageSources().fellOutOfWorld(), 4.0f);
+                }
+
+                // Track real HP changes (from mobs, projectiles, fire, starvation, etc.)
                 float hp = player.getHealth();
-                if (hp < lastHp - 0.01f) {
-                    System.out.println("[soma] hp " + lastHp + " -> " + hp);
+                if (hp < lastHp - 0.05f) {
+                    float dmg = lastHp - hp;
+                    pushEvent("hurt", Math.max(1, Math.round(dmg)), player.blockPosition());
                 }
                 lastHp = hp;
-
-                // lava / fire
-                if (player.isInLava()) {
-                    if (++hungerTick % 10 == 0) {
-                        player.setHealth(Math.max(0.5f, player.getHealth() - 1.0f));
-                        pushEvent("burn", 1, null);
-                    }
-                }
-
-                // hunger
-                hungerTick++;
-                if (hungerTick % 1200 == 0) {
-                    net.minecraft.world.food.FoodData fd = player.getFoodData();
-                    if (fd.getSaturationLevel() > 0) fd.setSaturation(fd.getSaturationLevel() - 1.0f);
-                    else if (fd.getFoodLevel() > 0) fd.setFoodLevel(fd.getFoodLevel() - 1);
-                    else { player.setHealth(Math.max(0.5f, player.getHealth() - 1.0f)); pushEvent("starve", 1, null); }
-                }
-
-                // regeneration
-                regenTick++;
-                if (regenTick % 400 == 0 && player.getFoodData().getFoodLevel() >= 18
-                        && player.getHealth() < player.getMaxHealth()) {
-                    player.setHealth(Math.min(player.getMaxHealth(), player.getHealth() + 0.5f));
-                }
             } catch (Throwable e) {
                 lastError.set("survival: " + e);
             }
         }
 
-        /** Survival-correct mining: progress depends on the tool and the block. */
+        // ----------------------------------------------------------- mining --
+        void selectBestToolFor(BlockState st) {
+            Inventory inv = player.getInventory();
+            int bestSlot = inv.selected;
+            float bestSpeed = inv.getItem(bestSlot).getDestroySpeed(st);
+            for (int i = 0; i < 9; i++) {
+                ItemStack s = inv.getItem(i);
+                if (s.isEmpty()) continue;
+                float spd = s.getDestroySpeed(st);
+                if (spd > bestSpeed) {
+                    bestSpeed = spd;
+                    bestSlot = i;
+                }
+            }
+            inv.selected = bestSlot;
+        }
+
+        void selectBestWeapon() {
+            Inventory inv = player.getInventory();
+            int bestSlot = inv.selected;
+            double bestScore = weaponScore(inv.getItem(bestSlot));
+            for (int i = 0; i < 9; i++) {
+                double sc = weaponScore(inv.getItem(i));
+                if (sc > bestScore) { bestScore = sc; bestSlot = i; }
+            }
+            inv.selected = bestSlot;
+        }
+
+        static double weaponScore(ItemStack st) {
+            if (st.isEmpty()) return 0.0;
+            Item it = st.getItem();
+            if (it instanceof SwordItem sw) return 10.0 + sw.getTier().getAttackDamageBonus();
+            if (it instanceof DiggerItem dg) return 5.0 + dg.getTier().getAttackDamageBonus();
+            return 0.5;
+        }
+
         void advanceMining() {
             if (miningPos == null || player == null) return;
             miningTicks++;
             try {
-                if (miningTicks > 160) { miningPos = null; pushEvent("dig_fail", 1, null); return; }
+                if (miningTicks > 160 || !miningPos.closerToCenterThan(player.position(), REACH + 1.5)) {
+                    miningPos = null;
+                    pushEvent("dig_fail", 1, null);
+                    finish(false, "dig_timeout");
+                    return;
+                }
                 BlockState st = bs(miningPos);
                 if (st == null || st.isAir()) {
                     miningPos = null;
-                    pushEvent("dig", 1, miningPos);
-                    finish(true, "mined");
+                    finish(true, "air");
                     return;
                 }
-                // vanilla-shaped mining: progress per tick depends on the tool
-                float prog = 1.0f;
-                try {
-                    prog = st.getDestroyProgress(player, level, miningPos);
-                } catch (Throwable e) {
+                selectBestToolFor(st);
+                float prog;
+                try { prog = st.getDestroyProgress(player, level, miningPos); }
+                catch (Throwable e) {
                     float hard = st.getDestroySpeed(level, miningPos);
                     prog = hard > 0 ? 1.0f / (hard * 30.0f) : 1.0f;
+                }
+                if (miningTicks % 5 == 0) {
+                    try { player.swing(InteractionHand.MAIN_HAND); } catch (Throwable ignored) {}
                 }
                 miningProgress += prog;
                 if (miningProgress >= 1.0f) {
                     miningProgress = 0.0f;
                     BlockPos done = miningPos;
+                    String bname = BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString();
                     boolean ok = player.gameMode.destroyBlock(done);
                     miningPos = null;
-                    pushEvent(ok ? "dig" : "dig_fail", 1, done);
+                    try { player.getFoodData().addExhaustion(0.005f); } catch (Throwable ignored) {}
+                    pushEvent(ok ? "dig" : "dig_fail", 1, done, bname);
                     finish(ok, "mined");
                 }
             } catch (Throwable e) {
                 miningPos = null;
                 pushEvent("dig_fail", 1, null);
+                finish(false, "dig_err");
             }
         }
 
         // --------------------------------------------------------- movement --
-        List<int[]> route = new ArrayList<>();
+        final List<int[]> route = new ArrayList<>();
         int routeIdx = 0;
 
         void planRoute(BlockPos goal) {
@@ -642,35 +736,49 @@ public class SomaMod {
             try {
                 List<int[]> p = aStar(player.blockPosition(), goal);
                 if (p != null && !p.isEmpty()) { route.addAll(p); pathMode = true; }
-            } catch (Throwable e) {
-                System.out.println("[soma] pathfinding failed: " + e);
-            }
+            } catch (Throwable ignored) {}
         }
 
         void driveActive() {
             if (player == null || activeTarget == null) return;
             if (!"goto".equals(activeAction)) return;
+
             double dx = (activeTarget.getX() + 0.5) - player.getX();
             double dz = (activeTarget.getZ() + 0.5) - player.getZ();
-            if (Math.hypot(dx, dz) < 0.9) { route.clear(); finish(true, "arrived"); return; }
-            // stuck watchdog: no progress for a while -> abort so the brain can retry
-            if (Math.abs(player.getX() - lastMoveX) < 0.05 && Math.abs(player.getZ() - lastMoveZ) < 0.05) {
-                if (++lastPosTick > 40) { route.clear(); lastPosTick = 0; finish(false, "stuck"); return; }
+            if (Math.hypot(dx, dz) < 0.85 && Math.abs(activeTarget.getY() - player.getY()) < 2.0) {
+                route.clear();
+                finish(true, "arrived");
+                return;
+            }
+            if (Math.abs(player.getX() - lastMoveX) < 0.04 && Math.abs(player.getZ() - lastMoveZ) < 0.04) {
+                if (++lastPosTick > 35) {
+                    route.clear();
+                    lastPosTick = 0;
+                    finish(false, "stuck");
+                    return;
+                }
             } else {
                 lastPosTick = 0;
                 lastMoveX = player.getX();
                 lastMoveZ = player.getZ();
             }
+
             if (pathMode && routeIdx < route.size()) {
                 int[] wp = route.get(routeIdx);
                 double wdx = wp[0] + 0.5 - player.getX();
                 double wdz = wp[2] + 0.5 - player.getZ();
-                if (Math.hypot(wdx, wdz) < 0.6) { routeIdx++; }
-                else { walkStep(wdx, wdz); activeTicks++; if (activeTicks > 600) { route.clear(); finish(false, "timeout"); } return; }
+                if (Math.hypot(wdx, wdz) < 0.6) {
+                    routeIdx++;
+                } else {
+                    walkStep(wdx, wdz);
+                    activeTicks++;
+                    if (activeTicks > 400) { route.clear(); finish(false, "timeout"); }
+                    return;
+                }
             }
             walkStep(dx, dz);
             activeTicks++;
-            if (activeTicks > 600) finish(false, "timeout");
+            if (activeTicks > 400) finish(false, "timeout");
         }
 
         void walkStep(double dx, double dz) {
@@ -678,20 +786,23 @@ public class SomaMod {
             if (dist < 1e-4) return;
             if (inWater()) { swimStep(dx, dz); return; }
             faceTowards(dx, dz);
-            try { player.setSprinting(true); } catch (Throwable ignored) {}
+            boolean sprint = player.getFoodData().getFoodLevel() > 6 && !player.isCrouching();
+            try { player.setSprinting(sprint); } catch (Throwable ignored) {}
             Vec3 d = player.getDeltaMovement();
-            double speed = 0.14;
+            double speed = player.isCrouching() ? 0.065 : (sprint ? 0.16 : 0.12);
             double tx = dx / dist * speed;
             double tz = dz / dist * speed;
-            double nvx = (d.x + (tx - d.x) * 0.30) * 0.98;
-            double nvz = (d.z + (tz - d.z) * 0.30) * 0.98;
-            double nvy = Math.max(d.y - 0.08, -0.7);
+            double nvx = (d.x + (tx - d.x) * 0.35) * 0.91;
+            double nvz = (d.z + (tz - d.z) * 0.35) * 0.91;
+            double nvy = Math.max(d.y - 0.08, -0.78);
             player.setDeltaMovement(nvx, nvy, nvz);
             if (player.horizontalCollision && player.onGround()) {
                 player.setDeltaMovement(nvx, 0.42, nvz);
+                try { player.getFoodData().addExhaustion(0.05f); } catch (Throwable ignored) {}
                 pushEvent("jump", 0, null);
             }
             player.move(MoverType.SELF, player.getDeltaMovement());
+            try { player.getFoodData().addExhaustion(sprint ? 0.01f : 0.002f); } catch (Throwable ignored) {}
         }
 
         void faceTowards(double dx, double dz) {
@@ -705,7 +816,7 @@ public class SomaMod {
             if (player == null) return false;
             try {
                 if (player.isInWater() || player.isInWaterOrBubble()) return true;
-                return level.getFluidState(player.blockPosition()).is(net.minecraft.tags.FluidTags.WATER);
+                return level.getFluidState(player.blockPosition()).is(FluidTags.WATER);
             } catch (Throwable e) { return false; }
         }
 
@@ -715,12 +826,12 @@ public class SomaMod {
             faceTowards(dx, dz);
             player.setSwimming(true);
             Vec3 d = player.getDeltaMovement();
-            double tx = dx / dist * 0.07;
-            double tz = dz / dist * 0.07;
+            double tx = dx / dist * 0.08;
+            double tz = dz / dist * 0.08;
             double nvx = (d.x + (tx - d.x) * 0.25) * 0.85;
             double nvz = (d.z + (tz - d.z) * 0.25) * 0.85;
-            boolean submerged = level.getFluidState(player.blockPosition().above()).is(net.minecraft.tags.FluidTags.WATER);
-            double nvy = submerged ? 0.09 : 0.015;
+            boolean submerged = level.getFluidState(player.blockPosition().above()).is(FluidTags.WATER);
+            double nvy = submerged ? 0.09 : 0.02;
             player.setDeltaMovement(nvx, nvy, nvz);
             player.move(MoverType.SELF, player.getDeltaMovement());
         }
@@ -736,49 +847,63 @@ public class SomaMod {
         boolean passable(BlockPos p) {
             BlockState st = bs(p);
             if (st == null) return false;
+            if (!st.getFluidState().isEmpty() && st.getFluidState().is(FluidTags.LAVA)) return false;
+            if (st.is(Blocks.FIRE) || st.is(Blocks.SOUL_FIRE) || st.is(Blocks.CACTUS)) return false;
             try { return st.getCollisionShape(level, p).isEmpty(); } catch (Throwable e) { return st.isAir(); }
         }
 
         boolean standable(BlockPos p) {
-            if (!passable(p)) return false;
-            if (!passable(p.above())) return false;
+            if (!passable(p) || !passable(p.above())) return false;
             BlockState below = bs(p.below());
             if (below == null) return false;
+            if (!below.getFluidState().isEmpty()) return below.getFluidState().is(FluidTags.WATER);
             try { return below.isFaceSturdy(level, p.below(), Direction.UP); } catch (Throwable e) { return false; }
         }
 
-        /** Compact A* over the block grid. Budgeted so it stays inside one tick. */
         List<int[]> aStar(BlockPos start, BlockPos goal) {
-            int limit = 900;
-            int maxRange = 48;
+            int limit = 700;
+            int maxRange = 40;
             Map<Long, Double> g = new HashMap<>();
             Map<Long, BlockPos> came = new HashMap<>();
             PriorityQueue<double[]> open = new PriorityQueue<>(Comparator.comparingDouble(a -> a[0]));
-            g.put(key(start.getX(), start.getZ()), 0.0);
-            open.add(new double[]{heur(start, goal), key(start.getX(), start.getZ()), 0, 0, 0});
+            long sk = key(start.getX(), start.getZ());
+            g.put(sk, 0.0);
+            open.add(new double[]{heur(start, goal), sk});
             Map<Long, BlockPos> node = new HashMap<>();
-            node.put(key(start.getX(), start.getZ()), start);
+            node.put(sk, start);
             int expanded = 0;
-            boolean found = false;
+            BlockPos bestNode = start;
+            double bestH = heur(start, goal);
+
             while (!open.isEmpty() && expanded < limit) {
                 double[] cur = open.poll();
                 long ck = (long) cur[1];
                 BlockPos cp = node.get(ck);
                 if (cp == null) continue;
-                if (cp.equals(goal)) { found = true; break; }
+                double ch = heur(cp, goal);
+                if (ch < bestH) { bestH = ch; bestNode = cp; }
+                if (cp.getX() == goal.getX() && cp.getZ() == goal.getZ() && Math.abs(cp.getY() - goal.getY()) <= 2) {
+                    bestNode = cp;
+                    break;
+                }
                 expanded++;
                 double cg = g.getOrDefault(ck, Double.MAX_VALUE);
                 for (int i = 0; i < 8; i++) {
                     int nx = cp.getX() + DX[i];
                     int nz = cp.getZ() + DZ[i];
                     if (Math.abs(nx - start.getX()) > maxRange || Math.abs(nz - start.getZ()) > maxRange) continue;
+                    // Diagonal corner check
+                    if (i >= 4) {
+                        if (!passable(new BlockPos(cp.getX() + DX[i], cp.getY() + 1, cp.getZ())) ||
+                            !passable(new BlockPos(cp.getX(), cp.getY() + 1, cp.getZ() + DZ[i]))) continue;
+                    }
                     BlockPos np = new BlockPos(nx, cp.getY(), nz);
-                    BlockPos up = np.above();
-                    BlockPos down = np.below();
                     boolean ok = standable(np);
-                    if (!ok && standable(down)) { np = down; ok = true; }
-                    if (!ok && standable(up)) { np = up; ok = true; }
+                    if (!ok && standable(np.below())) { np = np.below(); ok = true; }
+                    if (!ok && standable(np.above())) { np = np.above(); ok = true; }
+                    if (!ok && standable(np.below(2))) { np = np.below(2); ok = true; }
                     if (!ok) continue;
+
                     long nk = key(np.getX(), np.getZ());
                     double step = (i < 4) ? 1.0 : 1.414;
                     double ng = cg + step;
@@ -786,13 +911,13 @@ public class SomaMod {
                         g.put(nk, ng);
                         came.put(nk, cp);
                         node.put(nk, np);
-                        open.add(new double[]{ng + heur(np, goal), nk, np.getX(), np.getY(), np.getZ()});
+                        open.add(new double[]{ng + heur(np, goal), nk});
                     }
                 }
             }
-            if (!found) return null;
+            if (bestNode.equals(start)) return null;
             List<int[]> path = new ArrayList<>();
-            BlockPos cur = goal;
+            BlockPos cur = bestNode;
             int guard = 0;
             while (cur != null && !cur.equals(start) && guard++ < 200) {
                 path.add(new int[]{cur.getX(), cur.getY(), cur.getZ()});
@@ -806,7 +931,7 @@ public class SomaMod {
             double dx = Math.abs(a.getX() - b.getX());
             double dz = Math.abs(a.getZ() - b.getZ());
             double dy = Math.abs(a.getY() - b.getY());
-            return Math.max(dx, dz) + 0.414 * Math.min(dx, dz) + dy * 0.5;
+            return Math.max(dx, dz) + 0.414 * Math.min(dx, dz) + dy * 0.6;
         }
 
         // -------------------------------------------------------- execution --
@@ -821,15 +946,28 @@ public class SomaMod {
                 }
             }
             if (idx < 0) return;
-            if (activeTarget != null && ("goto".equals(activeAction) || "mine".equals(activeAction))) return;
-            // the brain picked an index in the candidate list of frame `sq`; using
-            // the CURRENT list would apply it to a completely different action
+
             if (sq >= 0) {
                 List<Map<String, Object>> list = candBySeq.get(sq);
                 if (list != null) candidates = list;
             }
+            if (idx >= candidates.size()) { pushEvent("bad_action", 1, null); return; }
+
+            Map<String, Object> c = candidates.get(idx);
+            String nextAct = String.valueOf(c.get("a"));
+            // Allow interrupting goto/mine when brain chooses urgent or different action
+            if (activeTarget != null && "mine".equals(activeAction) && "mine".equals(nextAct)) {
+                BlockPos p = new BlockPos(ip(c, "x"), ip(c, "y"), ip(c, "z"));
+                if (p.equals(miningPos)) return; // keep mining same block
+            }
+            if (activeTarget != null && "goto".equals(activeAction) && "goto".equals(nextAct)) {
+                BlockPos p = new BlockPos(ip(c, "x"), ip(c, "y"), ip(c, "z"));
+                if (p.equals(activeTarget)) return; // keep walking to same target
+            }
+            if (!"mine".equals(nextAct)) miningPos = null;
+
             actionCount++;
-            try { execute(idx); }
+            try { execute(c, nextAct); }
             catch (Throwable e) {
                 errorCount++;
                 lastError.set(String.valueOf(e));
@@ -837,10 +975,7 @@ public class SomaMod {
             }
         }
 
-        void execute(int idx) {
-            if (idx < 0 || idx >= candidates.size()) { pushEvent("bad_action", 1, null); return; }
-            Map<String, Object> c = candidates.get(idx);
-            String a = String.valueOf(c.get("a"));
+        void execute(Map<String, Object> c, String a) {
             switch (a) {
                 case "goto" -> {
                     activeAction = "goto";
@@ -851,17 +986,12 @@ public class SomaMod {
                 case "mine" -> {
                     BlockPos p = new BlockPos(ip(c, "x"), ip(c, "y"), ip(c, "z"));
                     if (!p.closerToCenterThan(player.position(), REACH + 1.5)) { pushEvent("act_fail", 1, null); return; }
-                    // look at the block and start digging with the tool in hand
-                    net.minecraft.world.phys.Vec3 eye = player.getEyePosition();
+                    Vec3 eye = player.getEyePosition();
                     double dx = p.getX() + 0.5 - eye.x, dy = p.getY() + 0.5 - eye.y, dz = p.getZ() + 0.5 - eye.z;
-                    double len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-                    if (len > 0) {
-                        player.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
-                        player.setYHeadRot(player.getYRot());
-                        player.setXRot((float) Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
-                    }
+                    player.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
+                    player.setYHeadRot(player.getYRot());
+                    player.setXRot((float) Math.toDegrees(-Math.atan2(dy, Math.hypot(dx, dz))));
                     miningPos = p;
-                    miningDir = Direction.UP;
                     miningTicks = 0;
                     miningProgress = 0.0f;
                     activeAction = "mine";
@@ -871,53 +1001,120 @@ public class SomaMod {
                 case "attack" -> {
                     int eid = ip(c, "eid");
                     Entity e = level.getEntity(eid);
-                    if (e == null || !e.isAlive() || e.distanceTo(player) > REACH + 1.5) { pushEvent("act_fail", 1, null); return; }
+                    if (e == null || !e.isAlive() || e.distanceTo(player) > REACH + 1.5) {
+                        pushEvent("act_fail", 1, null);
+                        return;
+                    }
+                    selectBestWeapon();
+                    faceTowards(e.getX() - player.getX(), e.getZ() - player.getZ());
+                    try { player.swing(InteractionHand.MAIN_HAND); } catch (Throwable ignored) {}
                     player.attack(e);
+                    player.resetAttackStrengthTicker();
+                    try { player.getFoodData().addExhaustion(0.1f); } catch (Throwable ignored) {}
                     lastAttackedId = e.getId();
                     lastAttackedName = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString();
-                    pushEvent("attack", 1, null);
+                    pushEvent("attack", 1, e.blockPosition(), lastAttackedName);
                     finish(true, "attacked");
                 }
                 case "use" -> {
                     BlockPos p = new BlockPos(ip(c, "x"), ip(c, "y"), ip(c, "z"));
+                    if (!p.closerToCenterThan(player.position(), REACH + 1.5)) { pushEvent("act_fail", 1, null); return; }
                     BlockHitResult hit = new BlockHitResult(
                         new Vec3(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5),
                         Direction.UP, p, false);
                     player.gameMode.useItemOn(player, level, player.getMainHandItem(), InteractionHand.MAIN_HAND, hit);
-                    pushEvent("use", 1, p);
+                    pushEvent("use", 1, p, String.valueOf(c.getOrDefault("n", "")));
                     finish(true, "used");
                 }
                 case "place" -> {
                     BlockPos p = new BlockPos(ip(c, "x"), ip(c, "y"), ip(c, "z"));
+                    int slot = selectBlockSlot();
+                    if (slot < 0) { pushEvent("act_fail", 1, null); return; }
+                    player.getInventory().selected = slot;
                     BlockHitResult hit = new BlockHitResult(
                         new Vec3(p.getX() + 0.5, p.getY(), p.getZ() + 0.5),
                         Direction.UP, p.below(), false);
                     player.gameMode.useItemOn(player, level, player.getMainHandItem(), InteractionHand.MAIN_HAND, hit);
-                    pushEvent("place", 1, p);
+                    pushEvent("place", 1, p, BuiltInRegistries.ITEM.getKey(player.getMainHandItem().getItem()).toString());
                     finish(true, "placed");
                 }
-                case "eat" -> {
-                    ItemStack food = findFoodItem();
-                    if (food == null) { pushEvent("act_fail", 1, null); return; }
-                    Inventory inv = player.getInventory();
-                    int slot = inv.selected;
-                    ItemStack old = inv.getItem(slot);
-                    inv.setItem(slot, food.copy());
-                    player.gameMode.useItem(player, level, inv.getItem(slot), InteractionHand.MAIN_HAND);
-                    if (!inv.getItem(slot).isEmpty()) {
-                        for (int i = 0; i < inv.getContainerSize(); i++) {
-                            if (inv.getItem(i).isEmpty() && !old.isEmpty()) { inv.setItem(i, old); break; }
-                        }
+                case "craft" -> {
+                    String rid = String.valueOf(c.getOrDefault("rid", ""));
+                    RecipeHolder<CraftingRecipe> rh = craftableById.get(rid);
+                    if (rh == null || !executeCraft(rh.value())) {
+                        pushEvent("act_fail", 1, null);
+                        return;
                     }
-                    pushEvent("eat", 1, null);
-                    finish(true, "ate");
+                    ItemStack res = rh.value().getResultItem(level.registryAccess());
+                    String nm = BuiltInRegistries.ITEM.getKey(res.getItem()).toString();
+                    pushEvent("craft", res.getCount(), player.blockPosition(), nm);
+                    finish(true, "crafted");
+                }
+                case "equip" -> {
+                    int slot = ip(c, "slot");
+                    if (slot >= 0 && slot < 9) {
+                        player.getInventory().selected = slot;
+                        pushEvent("equip", 1, null);
+                        finish(true, "equipped");
+                    } else {
+                        pushEvent("act_fail", 1, null);
+                    }
+                }
+                case "eat" -> {
+                    int fslot = findFoodSlot();
+                    if (fslot < 0) { pushEvent("act_fail", 1, null); return; }
+                    Inventory inv = player.getInventory();
+                    if (fslot < 9) {
+                        inv.selected = fslot;
+                    } else {
+                        ItemStack tmp = inv.getItem(inv.selected);
+                        inv.setItem(inv.selected, inv.getItem(fslot));
+                        inv.setItem(fslot, tmp);
+                    }
+                    ItemStack held = inv.getItem(inv.selected);
+                    var foodProps = held.get(DataComponents.FOOD);
+                    if (foodProps != null) {
+                        player.getFoodData().eat(foodProps);
+                        held.shrink(1);
+                        pushEvent("eat", 1, null, BuiltInRegistries.ITEM.getKey(held.getItem()).toString());
+                        finish(true, "ate");
+                    } else {
+                        pushEvent("act_fail", 1, null);
+                    }
+                }
+                case "interact_entity" -> {
+                    int eid = ip(c, "eid");
+                    Entity e = level.getEntity(eid);
+                    if (e == null || !e.isAlive() || e.distanceTo(player) > REACH + 1.5) {
+                        pushEvent("act_fail", 1, null);
+                        return;
+                    }
+                    faceTowards(e.getX() - player.getX(), e.getZ() - player.getZ());
+                    player.interactOn(e, InteractionHand.MAIN_HAND);
+                    pushEvent("interact", 1, e.blockPosition());
+                    finish(true, "interacted");
                 }
                 case "jump" -> {
-                    player.setDeltaMovement(player.getDeltaMovement().x, 0.42, player.getDeltaMovement().z);
+                    if (player.onGround()) {
+                        player.setDeltaMovement(player.getDeltaMovement().x, 0.42, player.getDeltaMovement().z);
+                        player.move(MoverType.SELF, player.getDeltaMovement());
+                        pushEvent("jump", 0, null);
+                    }
                     finish(true, "jumped");
                 }
+                case "sneak" -> {
+                    player.setShiftKeyDown(!player.isCrouching());
+                    finish(true, "sneaked");
+                }
+                case "drop" -> {
+                    ItemStack held = player.getMainHandItem();
+                    if (!held.isEmpty()) {
+                        player.drop(held.split(1), false);
+                    }
+                    finish(true, "dropped");
+                }
                 case "wait" -> finish(true, "waited");
-                case "stop" -> finish(true, "stopped");
+                case "stop" -> { route.clear(); miningPos = null; finish(true, "stopped"); }
                 default -> pushEvent("act_fail", 1, null);
             }
         }
@@ -929,43 +1126,185 @@ public class SomaMod {
             activeOk = ok;
         }
 
-        void pushEvent(String name, int mag, BlockPos p) {
-            if (events.size() >= EV_MAX) return;
-            Map<String, Object> m = new HashMap<>();
-            m.put("e", name);
-            m.put("m", mag);
-            if (p != null) { m.put("x", p.getX()); m.put("y", p.getY()); m.put("z", p.getZ()); }
-            events.add(m);
+        void pushEvent(String name, int mag, BlockPos p) { pushEvent(name, mag, p, null); }
+
+        void pushEvent(String name, int mag, BlockPos p, String itemOrBlock) {
+            synchronized (events) {
+                if (events.size() >= EV_MAX) return;
+                Map<String, Object> m = new HashMap<>();
+                m.put("e", name);
+                m.put("m", mag);
+                if (p != null) { m.put("x", p.getX()); m.put("y", p.getY()); m.put("z", p.getZ()); }
+                if (itemOrBlock != null && !itemOrBlock.isEmpty()) m.put("n", itemOrBlock);
+                events.add(m);
+            }
+        }
+
+        // ------------------------------------------------------- crafting --
+        boolean canCraftRecipe(CraftingRecipe recipe, Map<Item, Integer> invCounts) {
+            List<Ingredient> ings = recipe.getIngredients();
+            if (ings.isEmpty()) return false;
+            Map<Item, Integer> needed = new HashMap<>();
+            for (Ingredient ing : ings) {
+                if (ing.isEmpty()) continue;
+                boolean matched = false;
+                for (Map.Entry<Item, Integer> e : invCounts.entrySet()) {
+                    int used = needed.getOrDefault(e.getKey(), 0);
+                    if (e.getValue() - used > 0 && ing.test(new ItemStack(e.getKey()))) {
+                        needed.put(e.getKey(), used + 1);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return false;
+            }
+            return true;
+        }
+
+        boolean executeCraft(CraftingRecipe recipe) {
+            Inventory inv = player.getInventory();
+            List<Integer> slotsToConsume = new ArrayList<>();
+            Map<Integer, Integer> usedPerSlot = new HashMap<>();
+            for (Ingredient ing : recipe.getIngredients()) {
+                if (ing.isEmpty()) continue;
+                boolean matched = false;
+                for (int i = 0; i < 36; i++) {
+                    ItemStack st = inv.getItem(i);
+                    if (st.isEmpty()) continue;
+                    int already = usedPerSlot.getOrDefault(i, 0);
+                    if (st.getCount() - already > 0 && ing.test(st)) {
+                        usedPerSlot.put(i, already + 1);
+                        slotsToConsume.add(i);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return false;
+            }
+            for (Map.Entry<Integer, Integer> e : usedPerSlot.entrySet()) {
+                inv.getItem(e.getKey()).shrink(e.getValue());
+            }
+            ItemStack outStack = recipe.getResultItem(level.registryAccess()).copy();
+            if (!inv.add(outStack)) {
+                player.drop(outStack, false);
+            }
+            return true;
         }
 
         // ------------------------------------------------------- observation --
         BlockState bs(BlockPos p) {
             int cx = p.getX() >> 4, cz = p.getZ() >> 4;
-            if (cx != curCX || cz != curCZ) {
-                curCX = cx; curCZ = cz;
-                try { curChunk = level.getChunkSource().getChunk(cx, cz, false); }
-                catch (Throwable e) { curChunk = null; }
+            int dx = cx - cacheCX + 1, dz = cz - cacheCZ + 1;
+            if (dx < 0 || dx > 2 || dz < 0 || dz > 2) {
+                cacheCX = cx; cacheCZ = cz;
+                for (int ix = 0; ix < 3; ix++) {
+                    for (int iz = 0; iz < 3; iz++) {
+                        try { chunkCache[ix * 3 + iz] = level.getChunkSource().getChunk(cx + ix - 1, cz + iz - 1, false); }
+                        catch (Throwable e) { chunkCache[ix * 3 + iz] = null; }
+                    }
+                }
+                dx = 1; dz = 1;
             }
-            if (curChunk != null) {
-                try { return curChunk.getBlockState(p); } catch (Throwable e) { }
+            net.minecraft.world.level.chunk.LevelChunk ch = chunkCache[dx * 3 + dz];
+            if (ch != null) {
+                try { return ch.getBlockState(p); } catch (Throwable ignored) {}
             }
             gridFallbacks++;
             try { return level.getBlockState(p); } catch (Throwable e) { return null; }
         }
 
+        static boolean isHostile(Entity e) {
+            if (e instanceof Enemy) return true;
+            if (e instanceof NeutralMob nm && nm.isAngry()) return true;
+            return e.getType().getCategory() == MobCategory.MONSTER;
+        }
+
+        boolean isInteractable(BlockState st, BlockPos p) {
+            if (st == null || st.isAir()) return false;
+            if (st.getMenuProvider(level, p) != null) return true;
+            if (level.getBlockEntity(p) != null) return true;
+            var b = st.getBlock();
+            return b instanceof CraftingTableBlock || b instanceof FurnaceBlock
+                || b instanceof DoorBlock || b instanceof TrapDoorBlock
+                || b instanceof FenceGateBlock || b instanceof ButtonBlock
+                || b instanceof LeverBlock || b instanceof BedBlock
+                || st.is(BlockTags.DOORS) || st.is(BlockTags.BEDS) || st.is(BlockTags.BUTTONS);
+        }
+
         void sendObservation() {
             if (player == null || out == null) return;
-            long t0 = System.nanoTime();
             Vec3 pos = player.position();
             int bx = (int) Math.floor(pos.x), by = (int) Math.floor(pos.y), bz = (int) Math.floor(pos.z);
 
+            // Inventory summary & scan
+            Inventory inv = player.getInventory();
+            List<List<Object>> invOut = new ArrayList<>();
+            Map<Item, Integer> invCounts = new HashMap<>();
+            boolean hasFood = false, hasTool = false, hasWeapon = false, hasBlocks = false;
+            for (int i = 0; i < inv.getContainerSize(); i++) {
+                ItemStack st = inv.getItem(i);
+                if (st.isEmpty()) continue;
+                Item it = st.getItem();
+                invCounts.merge(it, st.getCount(), Integer::sum);
+                int isFood = st.get(DataComponents.FOOD) != null ? 1 : 0;
+                int isTool = (it instanceof TieredItem || it instanceof DiggerItem || it instanceof SwordItem) ? 1 : 0;
+                int isBlock = (it instanceof BlockItem) ? 1 : 0;
+                int isArmor = (it instanceof ArmorItem || it instanceof Equipable) ? 1 : 0;
+                double dur = st.isDamageableItem() ? (1.0 - (double) st.getDamageValue() / Math.max(1, st.getMaxDamage())) : 1.0;
+                if (isFood == 1) hasFood = true;
+                if (it instanceof DiggerItem) hasTool = true;
+                if (it instanceof SwordItem) hasWeapon = true;
+                if (isBlock == 1) hasBlocks = true;
+
+                List<Object> row = new ArrayList<>(8);
+                row.add(i);
+                row.add(BuiltInRegistries.ITEM.getId(it));
+                row.add(st.getCount());
+                row.add(isFood);
+                row.add(isTool);
+                row.add(isBlock);
+                row.add(isArmor);
+                row.add(round(dur));
+                invOut.add(row);
+            }
+
+            // Dense 8x8x8 grid (step=1, gap-free around feet)
+            boolean nearCraft = false, nearFurnace = false;
+            int k = 0;
+            for (int ix = 0; ix < GRID_N; ix++) {
+                for (int iy = 0; iy < GRID_N; iy++) {
+                    for (int iz = 0; iz < GRID_N; iz++) {
+                        BlockPos p = new BlockPos(bx - 3 + ix, by - 2 + iy, bz - 3 + iz);
+                        BlockState st = bs(p);
+                        int id = 0;
+                        int fl = 0;
+                        if (st != null && !st.isAir()) {
+                            id = BuiltInRegistries.BLOCK.getId(st.getBlock());
+                            if (!st.getCollisionShape(level, p).isEmpty()) fl |= 1;
+                            if (!st.getFluidState().isEmpty() || st.is(Blocks.FIRE) || st.is(Blocks.CACTUS)) fl |= 2;
+                            if (isInteractable(st, p)) fl |= 4;
+                            if (st.getBlock() instanceof CraftingTableBlock) nearCraft = true;
+                            if (st.getBlock() instanceof FurnaceBlock) nearFurnace = true;
+                        }
+                        gridIds[k] = id;
+                        gridFlags[k] = fl;
+                        k++;
+                    }
+                }
+            }
+
+            long dayTime = level.getDayTime() % 24000;
+            int curFood = player.getFoodData().getFoodLevel();
             Map<String, Object> self = new HashMap<>();
             Vec3 v = player.getDeltaMovement();
             self.put("x", pos.x); self.put("y", pos.y); self.put("z", pos.z);
             self.put("vx", v.x); self.put("vy", v.y); self.put("vz", v.z);
             self.put("yaw", player.getYRot()); self.put("pitch", player.getXRot());
             self.put("hp", player.getHealth());
-            self.put("food", player.getFoodData().getFoodLevel());
+            self.put("hp_d", player.getHealth() - lastHp);
+            self.put("food", curFood);
+            self.put("food_d", curFood - lastFood);
+            lastFood = curFood;
             self.put("air", player.getAirSupply());
             self.put("sat", player.getFoodData().getSaturationLevel());
             self.put("light", level.getMaxLocalRawBrightness(new BlockPos(bx, by, bz)));
@@ -973,109 +1312,101 @@ public class SomaMod {
             self.put("on_ground", player.onGround());
             self.put("in_water", inWater());
             self.put("in_lava", player.isInLava());
+            self.put("on_fire", player.isOnFire());
             self.put("sprinting", player.isSprinting());
             self.put("sneaking", player.isCrouching());
-            self.put("flying", player.getAbilities().flying);
-            self.put("fall", player.fallDistance);
+            self.put("fall", fallStartY >= 0 ? Math.max(0.0, fallStartY - pos.y) : 0.0);
             self.put("collided", player.horizontalCollision);
-            self.put("time", level.getDayTime() % 24000);
+            self.put("time", dayTime);
+            self.put("is_night", dayTime >= 13000 && dayTime <= 23000);
             self.put("raining", level.isRaining());
             self.put("thunder", level.isThundering());
-            long tSelf = System.nanoTime();
+            self.put("armor", player.getArmorValue());
+            self.put("atk_cd", player.getAttackStrengthScale(0.5f));
+            self.put("near_craft", nearCraft);
+            self.put("near_furnace", nearFurnace);
+            self.put("sel_slot", inv.selected);
+            self.put("has_food", hasFood);
+            self.put("has_tool", hasTool);
+            self.put("has_weapon", hasWeapon);
+            self.put("has_blocks", hasBlocks);
 
-            boolean rebuild = (seq % 2) == 0;
-            int[] ids = gridCache;
-            if (rebuild) {
-                int k = 0;
-                for (int ix = 0; ix < GRID_N; ix++) {
-                    for (int iy = 0; iy < GRID_N; iy++) {
-                        for (int iz = 0; iz < GRID_N; iz++) {
-                            BlockPos p = new BlockPos(bx - 7 + ix * GRID_STEP, by - 7 + iy * GRID_STEP, bz - 7 + iz * GRID_STEP);
-                            BlockState st = bs(p);
-                            int id = 0;
-                            if (st != null && !st.isAir()) {
-                                id = BuiltInRegistries.BLOCK.getId(st.getBlock());
-                                if (!blockNames.containsKey(id)) {
-                                    blockNames.put(id, BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString());
-                                }
-                            }
-                            gridCache[k++] = id;
-                        }
-                    }
-                }
-            }
-            long tGrid = System.nanoTime();
-
-            AABB area = new AABB(bx - 24, by - 24, bz - 24, bx + 24, by + 24, bz + 24);
+            // Entities (v2 12-field schema)
+            AABB area = new AABB(bx - 24, by - 16, bz - 24, bx + 24, by + 16, bz + 24);
             List<Entity> ents = new ArrayList<>(level.getEntitiesOfClass(Entity.class, area,
                 e -> e != player && e.isAlive()));
             ents.sort(Comparator.comparingDouble(e -> e.distanceToSqr(player)));
             List<List<Object>> entOut = new ArrayList<>();
             for (Entity e : ents) {
                 if (entOut.size() >= MAX_ENT) break;
-                List<Object> row = new ArrayList<>();
+                int role = 0;
+                if (e instanceof Player) role = 2;
+                else if (e instanceof ItemEntity) role = 3;
+                else if (e instanceof Projectile) role = 4;
+                else if (isHostile(e)) role = 1;
+
+                int tgtMe = (e instanceof Mob m && m.getTarget() == player) ? 1 : 0;
+                double hp = (e instanceof LivingEntity le) ? le.getHealth() : -1.0;
+                double maxHp = (e instanceof LivingEntity le) ? le.getMaxHealth() : 1.0;
+                Vec3 ev = e.getDeltaMovement();
+
+                List<Object> row = new ArrayList<>(12);
                 row.add(e.getId());
+                row.add(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString());
                 row.add(round(e.getX() - pos.x));
                 row.add(round(e.getY() - pos.y));
                 row.add(round(e.getZ() - pos.z));
                 row.add(round(e.distanceTo(player)));
-                row.add(e instanceof net.minecraft.world.entity.LivingEntity le ? le.getHealth() : -1.0);
-                row.add(e instanceof Enemy ? 1 : 0);
+                row.add(round(hp));
+                row.add(round(maxHp));
+                row.add(role);
+                row.add(tgtMe);
+                row.add(round(ev.x));
+                row.add(round(ev.z));
                 entOut.add(row);
             }
-            long tEnt = System.nanoTime();
 
-            Inventory inv = player.getInventory();
-            List<List<Object>> invOut = new ArrayList<>();
-            for (int i = 0; i < inv.getContainerSize(); i++) {
-                ItemStack st = inv.getItem(i);
-                if (st.isEmpty()) continue;
-                List<Object> row = new ArrayList<>();
-                row.add(i);
-                row.add(BuiltInRegistries.ITEM.getId(st.getItem()));
-                row.add(st.getCount());
-                row.add(st.get(net.minecraft.core.component.DataComponents.FOOD) != null ? 1 : 0);
-                invOut.add(row);
-            }
-            long tInv = System.nanoTime();
-
-            if (lastAttackedId >= 0 && level.getEntity(lastAttackedId) == null) {
-                Map<String, Object> kill = new HashMap<>();
-                kill.put("e", "kill"); kill.put("m", 1); kill.put("n", lastAttackedName);
-                events.add(kill);
-                lastAttackedId = -1;
+            // Kill check
+            if (lastAttackedId >= 0) {
+                Entity ae = level.getEntity(lastAttackedId);
+                if (ae == null || !ae.isAlive()) {
+                    pushEvent("kill", 1, player.blockPosition(), lastAttackedName);
+                    lastAttackedId = -1;
+                }
             }
 
-            List<Map<String, Object>> cands = buildCandidates(bx, by, bz);
+            int nextSeq = ++seq;
+            List<Map<String, Object>> cands = buildCandidates(bx, by, bz, ents, invCounts, nearCraft);
             candidates = cands;
-            candBySeq.put(seq, cands);
-            while (candBySeq.size() > 12) {
-                java.util.Iterator<Integer> it = candBySeq.keySet().iterator();
+            candBySeq.put(nextSeq, cands);
+            while (candBySeq.size() > 16) {
+                var it = candBySeq.keySet().iterator();
                 it.next();
                 it.remove();
             }
-            long tCand = System.nanoTime();
 
             Map<String, Object> frame = new HashMap<>();
             frame.put("t", "obs");
-            frame.put("seq", ++seq);
+            frame.put("seq", nextSeq);
             frame.put("tick", tickCounter);
-            frame.put("ms", System.currentTimeMillis());
             frame.put("self", self);
+
             Map<String, Object> grid = new HashMap<>();
-            grid.put("ox", bx - 7); grid.put("oy", by - 7); grid.put("oz", bz - 7);
-            grid.put("step", GRID_STEP); grid.put("n", GRID_N); grid.put("ids", ids);
+            grid.put("ox", bx - 3); grid.put("oy", by - 2); grid.put("oz", bz - 3);
+            grid.put("step", GRID_STEP); grid.put("n", GRID_N);
+            grid.put("ids", gridIds);
+            grid.put("flags", gridFlags);
             frame.put("grid", grid);
+
             frame.put("ent", entOut);
             frame.put("inv", invOut);
             frame.put("cand", cands);
+
             List<Map<String, Object>> ev;
             synchronized (events) { ev = new ArrayList<>(events); events.clear(); }
             frame.put("ev", ev);
-            frame.put("bmap", new ArrayList<>());
             frame.put("prev", Map.of("a", activeAction, "ticks", activeTicks, "ok", activeOk));
 
-            long tJson = System.nanoTime();
             try {
                 PrintWriter w = out;
                 if (w != null) {
@@ -1083,104 +1414,145 @@ public class SomaMod {
                     if (w.checkError()) lastError.set("write error");
                 }
             } catch (Throwable e) { errorCount++; }
-            long total = System.nanoTime() - t0;
-            if (seq % 10 == 0) {
-                System.out.println(String.format(Locale.ROOT,
-                    "[soma] obs #%d self=%.1fms grid=%.1fms ent=%.1fms inv=%.1fms cand=%.1fms json=%.1fms total=%.1fms cands=%d fb=%d",
-                    seq, (tSelf - t0) / 1e6, (tGrid - tSelf) / 1e6, (tEnt - tGrid) / 1e6,
-                    (tInv - tEnt) / 1e6, (tCand - tInv) / 1e6, (tJson - tCand) / 1e6,
-                    total / 1e6, cands.size(), gridFallbacks));
-            }
         }
 
         // -------------------------------------------------------- candidates --
-        List<Map<String, Object>> buildCandidates(int bx, int by, int bz) {
+        List<Map<String, Object>> buildCandidates(
+                int bx, int by, int bz,
+                List<Entity> ents, Map<Item, Integer> invCounts, boolean nearCraft) {
+
             List<Map<String, Object>> out = new ArrayList<>();
 
+            // 1. Combat & Entity interaction
+            for (Entity e : ents) {
+                double dist = e.distanceTo(player);
+                if (dist <= REACH) {
+                    boolean host = isHostile(e);
+                    if (host || e instanceof net.minecraft.world.entity.animal.Animal) {
+                        Map<String, Object> m = new HashMap<>();
+                        m.put("a", "attack"); m.put("eid", e.getId());
+                        m.put("n", BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString());
+                        m.put("d", round(dist));
+                        m.put("h", host ? 1 : 0);
+                        m.put("tgt", (e instanceof Mob mb && mb.getTarget() == player) ? 1 : 0);
+                        out.add(m);
+                    }
+                    if (e instanceof Player || e instanceof net.minecraft.world.entity.npc.AbstractVillager) {
+                        Map<String, Object> m = new HashMap<>();
+                        m.put("a", "interact_entity"); m.put("eid", e.getId());
+                        m.put("n", e.getName().getString());
+                        m.put("d", round(dist));
+                        m.put("player", (e instanceof Player) ? 1 : 0);
+                        out.add(m);
+                    }
+                } else if (dist < 24.0 && (e instanceof ItemEntity || isHostile(e) || e instanceof Player)) {
+                    Map<String, Object> m = new HashMap<>();
+                    m.put("a", "goto");
+                    m.put("x", (int) Math.floor(e.getX()));
+                    m.put("y", (int) Math.floor(e.getY()));
+                    m.put("z", (int) Math.floor(e.getZ()));
+                    m.put("d", round(dist));
+                    m.put("h", isHostile(e) ? 1 : 0);
+                    m.put("item_drop", (e instanceof ItemEntity) ? 1 : 0);
+                    m.put("player", (e instanceof Player) ? 1 : 0);
+                    out.add(m);
+                }
+                if (out.size() >= 10) break;
+            }
+
+            // 2. Eat if hungry
+            if (player.getFoodData().getFoodLevel() < 18 && findFoodSlot() >= 0) {
+                Map<String, Object> m = new HashMap<>();
+                m.put("a", "eat"); m.put("d", 0.0); m.put("val", 1.0);
+                out.add(m);
+            }
+
+            // 3. Craftable recipes (vanilla + all modded recipes, sorted by progression value)
+            craftableById.clear();
+            try {
+                int dim = nearCraft ? 3 : 2;
+                List<Map<String, Object>> craftCands = new ArrayList<>();
+                for (RecipeHolder<CraftingRecipe> rh : level.getRecipeManager().getAllRecipesFor(RecipeType.CRAFTING)) {
+                    CraftingRecipe rec = rh.value();
+                    if (!rec.canCraftInDimensions(dim, dim)) continue;
+                    if (!canCraftRecipe(rec, invCounts)) continue;
+                    ItemStack res = rec.getResultItem(level.registryAccess());
+                    if (res.isEmpty()) continue;
+                    String rid = rh.id().toString();
+                    String rname = BuiltInRegistries.ITEM.getKey(res.getItem()).toString();
+                    craftableById.put(rid, rh);
+                    double val = 0.2;
+                    if (res.getItem() instanceof TieredItem || res.getItem() instanceof ArmorItem) val = 1.0;
+                    else if (rname.contains("crafting_table") || rname.contains("furnace") || rname.contains("chest")) val = 0.95;
+                    else if (rname.contains("planks") || rname.contains("stick") || rname.contains("torch") || rname.contains("bed")) val = 0.8;
+                    else if (res.get(DataComponents.FOOD) != null) val = 0.7;
+                    Map<String, Object> m = new HashMap<>();
+                    m.put("a", "craft"); m.put("rid", rid); m.put("n", rname);
+                    m.put("d", 0.0); m.put("val", val);
+                    craftCands.add(m);
+                }
+                craftCands.sort((a, b) -> Double.compare((double) b.get("val"), (double) a.get("val")));
+                out.addAll(craftCands.subList(0, Math.min(6, craftCands.size())));
+            } catch (Throwable ignored) {}
+
+            // 4. Mine & Use nearby blocks (prioritize ores/logs/stone over plain dirt)
             List<Map<String, Object>> mine = new ArrayList<>();
+            List<Map<String, Object>> useList = new ArrayList<>();
             for (int dx = -4; dx <= 4; dx++) {
-                for (int dy = -3; dy <= 4; dy++) {
+                for (int dy = -2; dy <= 4; dy++) {
                     for (int dz = -4; dz <= 4; dz++) {
                         BlockPos p = new BlockPos(bx + dx, by + dy, bz + dz);
                         BlockState st = bs(p);
-                        if (st == null || st.isAir() || st.getFluidState().isSource()) continue;
+                        if (st == null || st.isAir() || !st.getFluidState().isEmpty()) continue;
                         if (st.getDestroySpeed(level, p) < 0) continue;
                         double d = Math.sqrt(dx * dx + dy * dy + dz * dz);
                         if (d > REACH) continue;
+                        String bname = BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString();
+                        double bval = 0.0;
+                        if (bname.contains("ore") || bname.contains("diamond") || bname.contains("ancient")) bval = 1.0;
+                        else if (bname.contains("log") || bname.contains("wood") || bname.contains("coal")) bval = 0.8;
+                        else if (bname.contains("stone") || bname.contains("cobble") || bname.contains("iron")) bval = 0.4;
                         Map<String, Object> m = new HashMap<>();
                         m.put("a", "mine"); m.put("x", p.getX()); m.put("y", p.getY()); m.put("z", p.getZ());
-                        m.put("n", BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString());
-                        m.put("d", round(d));
+                        m.put("n", bname); m.put("d", round(d)); m.put("val", bval);
                         mine.add(m);
+                        if (isInteractable(st, p) && useList.size() < 3) {
+                            Map<String, Object> u = new HashMap<>(m);
+                            u.put("a", "use");
+                            useList.add(u);
+                        }
                     }
                 }
             }
-            mine.sort(Comparator.comparingDouble(m -> (double) m.get("d")));
+            mine.sort(Comparator.comparingDouble(m -> (double) m.get("d") - 2.0 * (double) m.get("val")));
+            out.addAll(useList);
             out.addAll(mine.subList(0, Math.min(8, mine.size())));
 
-            AABB area = new AABB(bx - 32, by - 12, bz - 32, bx + 32, by + 12, bz + 32);
-            List<Entity> hostiles = new ArrayList<>(level.getEntitiesOfClass(Entity.class, area,
-                e -> e != player && e.isAlive() && e instanceof Enemy));
-            hostiles.sort(Comparator.comparingDouble(e -> e.distanceToSqr(player)));
-            int added = 0;
-            for (Entity e : hostiles) {
-                if (added >= 3) break;
-                if (e.distanceTo(player) > REACH) continue;
-                Map<String, Object> m = new HashMap<>();
-                m.put("a", "attack"); m.put("eid", e.getId());
-                m.put("n", BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString());
-                m.put("d", round(e.distanceTo(player)));
-                m.put("h", 1);
-                out.add(m);
-                added++;
-            }
-            if (!hostiles.isEmpty()) {
-                Entity h = hostiles.get(0);
-                double dist = h.distanceTo(player);
-                if (dist > REACH && dist < 32) {
-                    Map<String, Object> m = new HashMap<>();
-                    m.put("a", "goto");
-                    m.put("x", (int) Math.floor(h.getX()));
-                    m.put("y", (int) Math.floor(h.getY()));
-                    m.put("z", (int) Math.floor(h.getZ()));
-                    m.put("d", round(dist));
-                    out.add(m);
-                }
-            }
-
-            int used = 0;
-            for (Map<String, Object> m : mine) {
-                if (used >= 3) break;
-                String n = String.valueOf(m.get("n"));
-                if (!n.matches(".*(crafting_table|furnace|chest|barrel|door|lever|button|bed|anvil|loom|smithing|brewing|composter|beacon|shulker|hopper|dispenser|dropper|campfire|bell|jukebox|enchanting|bookshelf|cauldron).*")) continue;
-                Map<String, Object> c = new HashMap<>(m);
-                c.put("a", "use");
-                out.add(c);
-                used++;
-            }
-
-            ItemStack held = player.getMainHandItem();
-            if (!held.isEmpty()) {
+            // 5. Place block
+            if (selectBlockSlot() >= 0) {
                 for (int i = 0; i < 8; i++) {
                     double ang = i * Math.PI / 4;
                     int px = (int) Math.floor(player.getX() + Math.sin(ang) * 2);
                     int pz = (int) Math.floor(player.getZ() + Math.cos(ang) * 2);
-                    BlockState tgt = bs(new BlockPos(px, by, pz));
+                    BlockPos tp = new BlockPos(px, by, pz);
+                    BlockState tgt = bs(tp);
                     if (tgt == null || !tgt.isAir()) continue;
-                    BlockState ref = bs(new BlockPos(px, by - 1, pz));
-                    if (ref == null || !ref.isFaceSturdy(level, new BlockPos(px, by - 1, pz), Direction.UP)) continue;
+                    BlockState ref = bs(tp.below());
+                    if (ref == null || !ref.isFaceSturdy(level, tp.below(), Direction.UP)) continue;
                     Map<String, Object> m = new HashMap<>();
                     m.put("a", "place"); m.put("x", px); m.put("y", by); m.put("z", pz);
-                    m.put("n", held.getHoverName().getString()); m.put("d", 2);
+                    m.put("n", BuiltInRegistries.ITEM.getKey(player.getInventory().getItem(selectBlockSlot()).getItem()).toString());
+                    m.put("d", 2.0);
                     out.add(m);
                     break;
                 }
             }
 
+            // 6. Movement directions (8 angles x 2 distances)
             for (int i = 0; i < 8; i++) {
                 double ang = i * Math.PI / 4;
                 double sx = Math.sin(ang), sz = Math.cos(ang);
-                for (double dist : new double[]{2, 4, 7}) {
+                for (double dist : new double[]{3.0, 7.0}) {
                     int gx = (int) Math.floor(player.getX() + sx * dist);
                     int gz = (int) Math.floor(player.getZ() + sz * dist);
                     int gy = standY(gx, by, gz);
@@ -1191,48 +1563,41 @@ public class SomaMod {
                 }
             }
 
-            if (player.getFoodData().getFoodLevel() < 16 && findFoodItem() != null) {
-                Map<String, Object> m = new HashMap<>();
-                m.put("a", "eat"); m.put("d", 0);
-                out.add(m);
-            }
-            Map<String, Object> jump = new HashMap<>();
-            jump.put("a", "jump"); jump.put("d", 0);
-            out.add(jump);
-            Map<String, Object> wait = new HashMap<>();
-            wait.put("a", "wait"); wait.put("d", 0);
-            out.add(wait);
-            Map<String, Object> stop = new HashMap<>();
-            stop.put("a", "stop"); stop.put("d", 0);
-            out.add(stop);
+            // 7. Utility actions
+            out.add(Map.of("a", "jump", "d", 0.0));
+            out.add(Map.of("a", "wait", "d", 0.0));
+            out.add(Map.of("a", "stop", "d", 0.0));
 
             if (out.size() > MAX_CAND) out = out.subList(0, MAX_CAND);
             return out;
         }
 
-        ItemStack findFoodItem() {
-            try {
-                Inventory inv = player.getInventory();
-                for (int i = 0; i < inv.getContainerSize(); i++) {
-                    ItemStack st = inv.getItem(i);
-                    if (!st.isEmpty() && st.get(net.minecraft.core.component.DataComponents.FOOD) != null) return st;
-                }
-            } catch (Throwable ignored) {}
-            return null;
+        int findFoodSlot() {
+            Inventory inv = player.getInventory();
+            for (int i = 0; i < inv.getContainerSize(); i++) {
+                ItemStack st = inv.getItem(i);
+                if (!st.isEmpty() && st.get(DataComponents.FOOD) != null) return i;
+            }
+            return -1;
+        }
+
+        int selectBlockSlot() {
+            Inventory inv = player.getInventory();
+            if (!inv.getItem(inv.selected).isEmpty() && inv.getItem(inv.selected).getItem() instanceof BlockItem) {
+                return inv.selected;
+            }
+            for (int i = 0; i < 9; i++) {
+                ItemStack st = inv.getItem(i);
+                if (!st.isEmpty() && st.getItem() instanceof BlockItem) return i;
+            }
+            return -1;
         }
 
         int standY(int x, int nearY, int z) {
             for (int dy = 3; dy >= -4; dy--) {
                 int y = nearY + dy;
                 BlockPos p = new BlockPos(x, y, z);
-                BlockState below = bs(p.below());
-                if (below == null || below.isAir()) continue;
-                try { if (!below.isFaceSturdy(level, p.below(), Direction.UP)) continue; } catch (Throwable e) { continue; }
-                BlockState here = bs(p);
-                BlockState above = bs(p.above());
-                if (here == null || !here.isAir()) continue;
-                if (above == null || !above.isAir()) continue;
-                return y;
+                if (standable(p)) return y;
             }
             return Integer.MIN_VALUE;
         }
@@ -1254,6 +1619,6 @@ public class SomaMod {
             return o instanceof Number ? ((Number) o).intValue() : 0;
         }
 
-        static double round(double v) { return Math.round(v * 100000.0) / 100000.0; }
+        static double round(double v) { return Math.round(v * 10000.0) / 10000.0; }
     }
 }

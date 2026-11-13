@@ -10,7 +10,7 @@ tmux kill-session -t soma_trainer 2>/dev/null && echo "  soma_trainer stopped"
 sleep 2
 
 echo "[reset] removing model, replay buffer, metrics, logs"
-rm -fv "$ROOT"/data/replay.f16 "$ROOT"/data/replay.f16.hdr \
+rm -fv "$ROOT"/data/replay.f16 "$ROOT"/data/replay.f16.hdr "$ROOT"/data/replay.f16.prio \
        "$ROOT"/data/model.npz "$ROOT"/data/model.npz.tmp* \
        "$ROOT"/data/metrics.jsonl "$ROOT"/data/state.json \
        "$ROOT"/data/brain.log "$ROOT"/data/trainer.log

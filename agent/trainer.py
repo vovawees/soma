@@ -1,13 +1,12 @@
-"""SOMA training engine — separate process, low priority, batch updates.
+"""SOMA training engine v2 — Double Dueling DQN + PER + N-step + Polyak Target.
 
-Reads transitions the brain appended to the replay file, takes small SGD steps,
-and publishes the new weights atomically (tmp file + os.replace) so the brain
-never sees a half-written model.
-
-Run with:  nice -n 15 taskset -c 0-2 python3 trainer.py
+Reads N-step transitions from the disk-backed prioritized replay buffer,
+computes Double DQN targets, updates weights with Adam + gradient clipping,
+and atomically publishes checkpoints for brain.py.
 """
 
 import json
+import math
 import os
 import time
 
@@ -24,49 +23,58 @@ class Trainer:
         if os.path.exists(C.CKPT):
             try:
                 self.net.load(C.CKPT)
+                print(f'[train] loaded checkpoint ({self.net.nparams()/1e6:.2f}M params)')
             except Exception as e:
                 print('[train] load failed', e)
         self.buf = B.Replay()
         self.rng = np.random.RandomState(11)
         self.steps = 0
-        self.since_sync = 0
-        self.last_pub = 0.0
-        self.hist = []
+        self.cand_idx = np.arange(C.MAX_CAND)[None, :]
+
+    def _lr(self):
+        # Cosine annealing with floor
+        progress = min(1.0, self.steps / 100_000.0)
+        return C.LR_MIN + 0.5 * (C.LR - C.LR_MIN) * (1.0 + math.cos(math.pi * progress))
+
+    def _beta(self):
+        return min(1.0, C.PER_BETA_START + (1.0 - C.PER_BETA_START) * (self.steps / 100_000.0))
 
     # --------------------------------------------------------- batch prep --
-    def make_batch(self, recs):
+    def make_batch(self, recs, is_w):
         B_ = recs.shape[0]
         X0 = recs['X0'].astype(np.float32)
         X1 = recs['X1'].astype(np.float32)
-        Ls = recs['Ls'].reshape(B_, C.T, C.ENC).astype(np.float32)
+        Ls = recs['Ls'].reshape(B_, C.T + 2, C.ENC).astype(np.float32)
+        Ln = recs['Ln'].reshape(B_, C.T + 2, C.ENC).astype(np.float32)
         Cm = recs['Cm'].reshape(B_, C.MAX_CAND, C.CAND_DIM).astype(np.float32)
         Cn = recs['Cn'].reshape(B_, C.MAX_CAND, C.CAND_DIM).astype(np.float32)
-        nc = recs['nc'].astype(np.int64)
-        ncn = recs['ncn'].astype(np.int64)
+        nc = np.maximum(recs['nc'].astype(np.int64), 1)
+        ncn = np.maximum(recs['ncn'].astype(np.int64), 1)
 
-        ar = np.arange(B_)
-        mask = np.zeros((B_, C.MAX_CAND), dtype=np.float32)
-        for i in range(C.MAX_CAND):
-            mask[:, i] = (i < np.maximum(nc, 1)).astype(np.float32)
+        mask = (self.cand_idx < nc[:, None]).astype(np.float32)
+        mask_n = (self.cand_idx < ncn[:, None]).astype(np.float32)
 
-        # next-state latents and Q (target network, no grad)
-        L1 = self.net.embed(X1)[0]
-        Ls_next = np.concatenate([Ls[:, 1:, :], L1[:, None, :]], axis=1)
-        Xn = Ls_next.reshape(B_, C.T * C.ENC)
-        hn = np.maximum(Xn @ self.net.t['W3'] + self.net.t['b3'], 0.0, dtype=np.float32)
-        S_next = hn @ self.net.t['W4'] + self.net.t['b4']
+        # Double DQN: select best action with online net, evaluate with target net
+        S_next_online = self.net.temporal(Ln, use_target=False)[0]
+        q_next_online = self.net.q_all(S_next_online, Cn, mask=mask_n, use_target=False)[0]
+        q_next_online_masked = np.where(mask_n > 0, q_next_online, -1e9)
+        best_a = np.argmax(q_next_online_masked, axis=1)
 
-        ar2 = np.arange(B_)
-        Xq = np.concatenate(
-            [np.repeat(S_next[:, None, :], C.MAX_CAND, axis=1), Cn], axis=2
-        ).reshape(B_ * C.MAX_CAND, C.ENC + C.CAND_DIM)
-        hq = np.maximum(Xq @ self.net.t['W5'] + self.net.t['b5'], 0.0, dtype=np.float32)
-        q_next = (hq @ self.net.t['W6'] + self.net.t['b6']).reshape(B_, C.MAX_CAND)
+        S_next_target = self.net.temporal(Ln, use_target=True)[0]
+        q_next_target = self.net.q_all(S_next_target, Cn, mask=mask_n, use_target=True)[0]
+        q_target_sel = q_next_target[np.arange(B_), best_a]
+        q_target_sel = np.where(np.isfinite(q_target_sel), q_target_sel, 0.0).astype(np.float32)
+
+        ns = recs['ns'].astype(np.float32) if 'ns' in recs.dtype.names else float(C.N_STEP)
 
         return {
             'X0': X0, 'X1': X1, 'Ls': Ls, 'Cmat': Cm, 'mask': mask,
-            'ai': recs['ai'].astype(np.int64), 'rew': recs['rw'].astype(np.float32),
-            'done': recs['dn'].astype(np.float32), 'q_next': q_next,
+            'ai': recs['ai'].astype(np.int64),
+            'rew': recs['rw'].astype(np.float32),
+            'done': recs['dn'].astype(np.float32),
+            'q_target_sel': q_target_sel,
+            'is_w': is_w,
+            'n_step': ns,
         }
 
     # -------------------------------------------------------------- loop ---
@@ -75,44 +83,51 @@ class Trainer:
         while self.buf.count < C.WARMUP:
             time.sleep(1.0)
 
-        last_ckpt = 0.0
         while True:
-            recs, _ = self.buf.sample(self.rng, C.BATCH)
+            t0 = time.time()
+            recs, idx, is_w = self.buf.sample(self.rng, C.BATCH, alpha=C.PER_ALPHA, beta=self._beta())
             if recs is None:
                 time.sleep(0.5)
                 continue
-            batch = self.make_batch(recs)
+
+            batch = self.make_batch(recs, is_w)
             grads, info = M.train_batch(self.net, batch)
-            self.net.step(grads, C.LR)
+            gnorm = self.net.step(grads, self._lr())
+            self.net.soft_sync_target(C.TAU)
+            self.buf.update_priorities(idx, info['td_vec'])
+
             self.steps += 1
-            self.since_sync += 1
-
-            if self.since_sync >= C.TARGET_SYNC:
-                self.net.sync_target()
-                self.since_sync = 0
-
-            if self.steps % 20 == 0:
-                print('[train] step=%d buf=%d q_loss=%.4f v_loss=%.4f aux=%.4f q=%.3f td=%.3f'
-                      % (self.steps, self.buf.count, info['q_loss'], info['v_loss'],
-                         info['aux_loss'], info['q'], info['td']))
-            if self.steps % 200 == 0:
+            if self.steps % 50 == 0:
+                print('[train] step=%d buf=%d lr=%.2e q_loss=%.4f aux=%.4f q=%.3f td=%.3f g=%.2f'
+                      % (self.steps, self.buf.count, self._lr(), info['q_loss'],
+                         info['aux_loss'], info['q'], info['td'], gnorm))
+            if self.steps % 150 == 0:
                 self.publish()
-                last_ckpt = time.time()
-
             if self.steps % 500 == 0:
-                self.log()
+                self.log(info)
+
+            dt = (time.time() - t0) * 1000.0
+            if dt < C.TRAIN_EVERY_MS:
+                time.sleep((C.TRAIN_EVERY_MS - dt) / 1000.0)
 
     def publish(self):
-        # np.savez appends .npz when the name does not already end with it
         tmp = C.CKPT + f'.tmp.{os.getpid()}.npz'
         self.net.save(tmp)
         os.replace(tmp, C.CKPT)
 
-    def log(self):
-        rec = {'ts': time.time(), 'train_steps': self.steps, 'buffer': self.buf.count,
-               'params': self.net.nparams()}
-        with open(C.LOG, 'a') as f:
-            f.write(json.dumps(rec) + '\n')
+    def log(self, info):
+        rec = {
+            'ts': time.time(), 'train_steps': self.steps, 'buffer': self.buf.count,
+            'params': self.net.nparams(),
+            'q_loss': round(info['q_loss'], 5),
+            'aux_loss': round(info['aux_loss'], 5),
+            'td': round(info['td'], 4),
+        }
+        try:
+            with open(C.LOG, 'a') as f:
+                f.write(json.dumps(rec) + '\n')
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
