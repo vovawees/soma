@@ -100,6 +100,8 @@ public class SomaMod {
                 .then(net.minecraft.commands.Commands.literal("status")
                     .executes(c -> { if (agent != null) { agent.start(); agent.status(c.getSource()); }
                                      return 1; }))
+                .then(net.minecraft.commands.Commands.literal("hurt")
+                    .executes(c -> { if (agent != null) agent.debugHurt(3); return 1; }))
                 .then(net.minecraft.commands.Commands.literal("cleanup")
                     .executes(c -> { if (agent != null) agent.cleanupStands(true);
                                      return 1; }))
@@ -152,6 +154,9 @@ public class SomaMod {
         final List<Map<String, Object>> events = new ArrayList<>();
         final Map<Integer, String> blockNames = new HashMap<>();
         List<Map<String, Object>> candidates = new ArrayList<>();
+        final java.util.Map<Integer, List<Map<String, Object>>> candBySeq = new java.util.LinkedHashMap<>();
+        int lastPosTick = 0;
+        double lastMoveX = 0, lastMoveZ = 0;
 
         BlockPos miningPos = null;
         Direction miningDir = Direction.UP;
@@ -204,9 +209,21 @@ public class SomaMod {
                     + " hp=" + (player == null ? 0 : (int) player.getHealth())
                     + " food=" + (player == null ? 0 : player.getFoodData().getFoodLevel())
                     + " inv=" + (player == null ? 0 : countItems())
+                    + " gm=" + (player == null ? "-" : player.gameMode.getGameModeForPlayer())
+                    + " fly=" + (player == null ? "-" : (player.getAbilities().mayfly + "/" + player.getAbilities().flying))
+                    + " spec=" + (player == null ? "-" : player.isSpectator())
                     + " players=" + server.getPlayerList().getPlayers().size()
                     + " inTab=" + server.getPlayerList().getPlayers().contains(player)
                     + " errors=" + errorCount + " lastError=" + lastError.get()), true);
+        }
+
+        /** Debug: apply damage to the agent so the damage path can be verified. */
+        void debugHurt(float amount) {
+            if (player == null) return;
+            float before = player.getHealth();
+            player.setHealth(Math.max(0.5f, before - amount));
+            pushEvent("debug_hurt", (int) amount, null);
+            System.out.println("[soma] debug hurt " + before + " -> " + player.getHealth());
         }
 
         int countItems() {
@@ -232,6 +249,7 @@ public class SomaMod {
                         in = new BufferedReader(new InputStreamReader(s.getInputStream()));
                         out = new PrintWriter(s.getOutputStream(), true);
                         System.out.println("[soma] brain connected");
+                        lastError.set("not started");
                         String line;
                         while (running.get() && (line = in.readLine()) != null) {
                             line = line.trim();
@@ -241,9 +259,10 @@ public class SomaMod {
                                 Object t = msg.get("t");
                                 Object i = msg.get("i");
                                 if ("act".equals(t) && i instanceof Number) {
+                                    int sq = msg.get("s") instanceof Number ? ((Number) msg.get("s")).intValue() : -1;
                                     synchronized (incoming) {
                                         incoming.clear();
-                                        incoming.add(new int[]{((Number) i).intValue()});
+                                        incoming.add(new int[]{((Number) i).intValue(), sq});
                                     }
                                 }
                             } catch (Exception e) { errorCount++; }
@@ -273,6 +292,13 @@ public class SomaMod {
                 player.setPos(spawn.getX() + 0.5, findGroundY(spawn.getX(), spawn.getZ()) + 1.0, spawn.getZ() + 0.5);
                 setSurvival();
                 attachToServer();
+                // AFTER placeNewPlayer: it reloads the player NBT from disk and wipes
+                // anything we put in the inventory before that
+                giveStarterKit();
+                try {
+                    player.getFoodData().setFoodLevel(20);
+                    player.getFoodData().setSaturation(5.0f);
+                } catch (Throwable ignored) {}
                 System.out.println("[soma] fake player created at " + player.getX() + "," + player.getY()
                     + "," + player.getZ() + " visible=" + playerVisible);
             }
@@ -288,6 +314,20 @@ public class SomaMod {
                 player.getAbilities().flying = false;
                 player.getAbilities().invulnerable = false;
             } catch (Throwable ignored) {}
+        }
+
+        /** Bootstrap: without a tool and food the agent cannot survive (and cannot craft). */
+        void giveStarterKit() {
+            try {
+                Inventory inv = player.getInventory();
+                inv.setItem(0, new ItemStack(net.minecraft.world.item.Items.WOODEN_PICKAXE));
+                inv.setItem(1, new ItemStack(net.minecraft.world.item.Items.BREAD, 3));
+                inv.setItem(2, new ItemStack(net.minecraft.world.item.Items.TORCH, 8));
+                inv.selected = 0;
+                System.out.println("[soma] starter kit given");
+            } catch (Throwable e) {
+                System.out.println("[soma] starter kit failed: " + e);
+            }
         }
 
         void attachToServer() {
@@ -367,6 +407,7 @@ public class SomaMod {
                 if (player.getHealth() > 0.5f) { snapshotInventory(); return; }
                 pushEvent("death", 1, null);
                 player.setHealth(player.getMaxHealth());
+                try { player.getFoodData().setFoodLevel(20); player.getFoodData().setSaturation(5.0f); } catch (Throwable ignored) {}
                 restoreInventory();
                 BlockPos sp = level.getSharedSpawnPos();
                 player.setPos(sp.getX() + 0.5, findGroundY(sp.getX(), sp.getZ()) + 1.0, sp.getZ() + 0.5);
@@ -550,6 +591,14 @@ public class SomaMod {
             double dx = (activeTarget.getX() + 0.5) - player.getX();
             double dz = (activeTarget.getZ() + 0.5) - player.getZ();
             if (Math.hypot(dx, dz) < 0.9) { route.clear(); finish(true, "arrived"); return; }
+            // stuck watchdog: no progress for a while -> abort so the brain can retry
+            if (Math.abs(player.getX() - lastMoveX) < 0.05 && Math.abs(player.getZ() - lastMoveZ) < 0.05) {
+                if (++lastPosTick > 40) { route.clear(); lastPosTick = 0; finish(false, "stuck"); return; }
+            } else {
+                lastPosTick = 0;
+                lastMoveX = player.getX();
+                lastMoveZ = player.getZ();
+            }
             if (pathMode && routeIdx < route.size()) {
                 int[] wp = route.get(routeIdx);
                 double wdx = wp[0] + 0.5 - player.getX();
@@ -701,11 +750,22 @@ public class SomaMod {
         // -------------------------------------------------------- execution --
         void pollAndExecute() {
             int idx = -1;
+            int sq = -1;
             synchronized (incoming) {
-                if (!incoming.isEmpty()) idx = incoming.poll()[0];
+                if (!incoming.isEmpty()) {
+                    int[] a = incoming.poll();
+                    idx = a[0];
+                    sq = a.length > 1 ? a[1] : -1;
+                }
             }
             if (idx < 0) return;
             if (activeTarget != null && ("goto".equals(activeAction) || "mine".equals(activeAction))) return;
+            // the brain picked an index in the candidate list of frame `sq`; using
+            // the CURRENT list would apply it to a completely different action
+            if (sq >= 0) {
+                List<Map<String, Object>> list = candBySeq.get(sq);
+                if (list != null) candidates = list;
+            }
             actionCount++;
             try { execute(idx); }
             catch (Throwable e) {
@@ -926,6 +986,12 @@ public class SomaMod {
 
             List<Map<String, Object>> cands = buildCandidates(bx, by, bz);
             candidates = cands;
+            candBySeq.put(seq, cands);
+            while (candBySeq.size() > 12) {
+                java.util.Iterator<Integer> it = candBySeq.keySet().iterator();
+                it.next();
+                it.remove();
+            }
             long tCand = System.nanoTime();
 
             Map<String, Object> frame = new HashMap<>();
@@ -990,7 +1056,7 @@ public class SomaMod {
             mine.sort(Comparator.comparingDouble(m -> (double) m.get("d")));
             out.addAll(mine.subList(0, Math.min(8, mine.size())));
 
-            AABB area = new AABB(bx - 16, by - 8, bz - 16, bx + 16, by + 8, bz + 16);
+            AABB area = new AABB(bx - 32, by - 12, bz - 32, bx + 32, by + 12, bz + 32);
             List<Entity> hostiles = new ArrayList<>(level.getEntitiesOfClass(Entity.class, area,
                 e -> e != player && e.isAlive() && e instanceof Enemy));
             hostiles.sort(Comparator.comparingDouble(e -> e.distanceToSqr(player)));
@@ -1009,7 +1075,7 @@ public class SomaMod {
             if (!hostiles.isEmpty()) {
                 Entity h = hostiles.get(0);
                 double dist = h.distanceTo(player);
-                if (dist > REACH && dist < 16) {
+                if (dist > REACH && dist < 32) {
                     Map<String, Object> m = new HashMap<>();
                     m.put("a", "goto");
                     m.put("x", (int) Math.floor(h.getX()));

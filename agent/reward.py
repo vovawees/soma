@@ -103,7 +103,7 @@ class Reward:
                 nm = e.get('n')
                 if nm and nm not in self.seen_blocks:
                     self.seen_blocks.add(nm)
-                    r += 0.25
+                    r += 0.40
                     info['new_block'] = nm
                 else:
                     r += 0.06
@@ -124,17 +124,17 @@ class Reward:
             for k in gained:
                 if k not in self.seen_items:
                     self.seen_items.add(k)
-                    r += 0.30
+                    r += 0.50
                     info['new_item'] = int(k)
 
         # --- spatial novelty ---
         x, z = float(s.get('x', 0)), float(s.get('z', 0))
         visits = self._visit(x, z)
         if visits == 1:
-            r += 0.25
+            r += 0.50
             info['new_chunk'] = 1
         else:
-            r += 0.05 / (1.0 + math.log(visits))
+            r += 0.08 / (1.0 + math.log(visits))
 
         # --- idling ---
         pos = (round(x, 2), round(float(s.get('y', 0)), 2), round(z, 2))
@@ -143,8 +143,14 @@ class Reward:
         else:
             self.idle = 0
         self.last_pos = pos
-        if self.idle > 40:
-            r -= 0.01
+        if self.idle > 25:
+            r -= 0.03
+
+        # --- reward for actually travelling: keep it moving ---
+        if self.last_pos is not None:
+            moved = math.dist(pos, self.last_pos)
+            if moved > 0.05:
+                r += min(0.05, moved * 0.02)
 
         # --- time cost, tiny ---
         r -= 0.005

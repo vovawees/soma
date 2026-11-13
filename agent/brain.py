@@ -45,6 +45,9 @@ class Brain:
         self.choices = 0
         self.rng = np.random.RandomState(7)
         self.last_save = 0.0
+        self.frame_seq = 0
+        self.last_type = None
+        self.repeat = 0
         self.step_n = 0
         self.model_mtime = 0.0
         self.log_every = 50
@@ -81,7 +84,17 @@ class Brain:
         Q = self.net.q_all(S, Mx[None, ...])[0][0]
         self.ck = float(np.mean(Q[:n]))
         # epsilon-greedy over admissible candidates
-        self.eps = max(0.05, 0.30 * (0.9995 ** self.step_n))
+        self.eps = max(0.15, 0.30 * (0.9995 ** self.step_n))
+        # if the policy keeps picking the same kind of action it is stuck in a loop:
+        # force exploration for a while
+        atype = str(cands[0].get('a')) if cands else ''
+        if atype == self.last_type:
+            self.repeat += 1
+        else:
+            self.repeat = 1
+            self.last_type = atype
+        if self.repeat > 8:
+            self.eps = max(self.eps, 0.4)
         if self.rng.rand() < self.eps:
             return int(self.rng.randint(0, n))
         return int(np.argmax(Q[:n]))
@@ -213,7 +226,7 @@ def main():
 
             try:
                 ai = br.on_frame(fr)
-                sock.sendall((json.dumps({'t': 'act', 'i': ai}) + '\n').encode())
+                sock.sendall((json.dumps({'t': 'act', 'i': ai, 's': br.frame_seq}) + '\n').encode())
             except Exception as e:
                 # one malformed frame must never take the agent down
                 br.errors += 1
