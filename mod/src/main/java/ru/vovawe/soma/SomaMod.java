@@ -343,6 +343,9 @@ public class SomaMod {
                     @Override public boolean isInvulnerableTo(net.minecraft.world.damagesource.DamageSource d) { return false; }
                     @Override public boolean isInvulnerable() { return false; }
                     @Override public void tick() { /* driven by Agent.tick() */ }
+                    /** attackStrengthTicker is protected in LivingEntity; a subclass may
+                     *  touch its own instance, the Agent class may not. */
+                    public void bumpAttackCooldown() { this.attackStrengthTicker++; }
                     @Override public boolean isSpectator() { return false; }
                     @Override public boolean isInvisible() { return false; }
                     @Override public boolean canBeSeenAsEnemy() { return isAlive(); }
@@ -555,7 +558,7 @@ public class SomaMod {
                 try { player.baseTick(); } catch (Throwable ignored) {}
                 if (player.tickCount <= tcBefore) player.tickCount = tcBefore + 1;
                 try { player.getFoodData().tick(player); } catch (Throwable ignored) {}
-                try { player.attackStrengthTicker++; } catch (Throwable ignored) {}
+                try { player.bumpAttackCooldown(); } catch (Throwable ignored) {}
 
                 survivalTick();
                 handleDeathAndRespawn();
