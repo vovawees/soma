@@ -15,12 +15,17 @@ CLIP = 3.0
 # event -> base reward
 EVT = {
     'dig': 0.0,          # handled specially (novelty)
-    'attack': 0.10,
-    'use': 0.03,
+    'attack': 0.12,
+    'kill': 1.5,         # a mob died because of us
+    'use': 0.05,
     'place': -0.03,
     'eat': 0.0,
+    'fall': -0.08,       # scaled by the damage
+    'burn': -0.15,
+    'starve': -0.15,
+    'jump': 0.0,
     'act_fail': -0.06,
-    'dig_fail': -0.06,
+    'dig_fail': -0.08,
     'bad_action': -0.08,
     'death': -3.0,
     'info': 0.0,
@@ -80,18 +85,28 @@ class Reward:
             elif name == 'hurt':
                 pass  # already counted via hp delta
             elif name == 'eat':
-                r += 0.10 if float(s.get('food', 20)) < 18 else -0.02
+                r += 0.15 if float(s.get('food', 20)) < 18 else -0.02
+            elif name == 'fall':
+                r += EVT['fall'] * min(mag, 20.0)
             else:
                 r += EVT.get(name, 0.0)
             if name == 'death':
                 self.dead += 1
                 self.episode += 1
                 info['death'] = 1
+            if name == 'kill':
+                info['kill'] = 1
 
         # --- novel block types mined ---
         for e in (events or []):
             if isinstance(e, dict) and e.get('e') == 'dig':
-                pass  # the bot does not send block names here; handled below
+                nm = e.get('n')
+                if nm and nm not in self.seen_blocks:
+                    self.seen_blocks.add(nm)
+                    r += 0.25
+                    info['new_block'] = nm
+                else:
+                    r += 0.06
 
         # --- inventory: new item types ---
         inv_now = {}
@@ -152,6 +167,7 @@ class Reward:
     def state(self):
         return {
             'seen_items': sorted(self.seen_items),
+            'seen_blocks': sorted(self.seen_blocks),
             'chunks': self.chunks,
             'steps': self.steps,
             'total': self.total,
@@ -161,6 +177,7 @@ class Reward:
 
     def load(self, st):
         self.seen_items = set(st.get('seen_items', []))
+        self.seen_blocks = set(st.get('seen_blocks', []))
         self.chunks = st.get('chunks', {})
         self.steps = st.get('steps', 0)
         self.total = st.get('total', 0.0)
