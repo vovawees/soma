@@ -72,7 +72,8 @@ flowchart TB
 
     MC <-->|протокол 1.21.1| BOT
     MC <-->|API сервера| MOD
-    MOD & BOT <-->|"newline JSON<br/>127.0.0.1:8787/8788"| BR
+    MOD <-->|"JSON 127.0.0.1:8788"| BR
+    BOT <-->|"JSON 127.0.0.1:8787"| BR
     BR --> ENC --> NET
     BR --> RW
     BR --> BUF
