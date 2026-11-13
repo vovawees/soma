@@ -8,4 +8,5 @@ __pycache__/
 *.npz.tmp*
 replay.f16
 replay.f16.hdr
-.DS_Store
+.DS_Storemod/build/
+build/

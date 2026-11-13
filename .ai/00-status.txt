@@ -37,7 +37,7 @@ MC server        /home/opc/ai_workspace/create-aeronautics-server
 
 HARDWARE
 VPS: Oracle aarch64 (Ampere A1), 4 OCPU, 24 GB. NEON only, NO AVX2. No docker.
-     firewalld + OCI SL: only 22/tcp. tailscale up (100.83.245.109).
+     firewalld + OCI SL: only 22/tcp. tailscale up (<TAILSCALE_IP>).
 local PC: i5-6500, 4C/4T, AVX2, 15 GB.
 
 BUILD (no Gradle, no ModDevGradle)
