@@ -100,6 +100,8 @@ public class SomaMod {
                 .then(net.minecraft.commands.Commands.literal("status")
                     .executes(c -> { if (agent != null) { agent.start(); agent.status(c.getSource()); }
                                      return 1; }))
+                .then(net.minecraft.commands.Commands.literal("spawnmob")
+                    .executes(c -> { if (agent != null) agent.spawnTestMob(); return 1; }))
                 .then(net.minecraft.commands.Commands.literal("hurt")
                     .executes(c -> { if (agent != null) agent.debugHurt(3); return 1; }))
                 .then(net.minecraft.commands.Commands.literal("cleanup")
@@ -162,7 +164,8 @@ public class SomaMod {
         Direction miningDir = Direction.UP;
         int miningTicks = 0;
         float miningProgress = 0.0f;
-        double fallTrack = 0.0;
+        double fallStartY = -1.0;
+        double lastHp = 20.0;
         int hungerTick = 0;
         int regenTick = 0;
 
@@ -212,9 +215,25 @@ public class SomaMod {
                     + " gm=" + (player == null ? "-" : player.gameMode.getGameModeForPlayer())
                     + " fly=" + (player == null ? "-" : (player.getAbilities().mayfly + "/" + player.getAbilities().flying))
                     + " spec=" + (player == null ? "-" : player.isSpectator())
+                    + " mobs=" + (player == null ? 0 : countHostiles())
+                    + " inLevel=" + (player != null && level.players().contains(player))
                     + " players=" + server.getPlayerList().getPlayers().size()
                     + " inTab=" + server.getPlayerList().getPlayers().contains(player)
+                    + " mobs: " + lastMobInfo
                     + " errors=" + errorCount + " lastError=" + lastError.get()), true);
+        }
+
+        /** Debug: drop a zombie next to the agent so the damage path can be verified. */
+        void spawnTestMob() {
+            try {
+                net.minecraft.world.entity.Mob m = net.minecraft.world.entity.EntityType.ZOMBIE.create(level);
+                m.moveTo(player.getX() + 2.0, player.getY(), player.getZ());
+                level.addFreshEntity(m);
+                System.out.println("[soma] test zombie spawned at " + m.getX() + "," + m.getY() + "," + m.getZ()
+                    + " agentInvulnerable=" + player.isInvulnerable());
+            } catch (Throwable e) {
+                System.out.println("[soma] spawn failed: " + e);
+            }
         }
 
         /** Debug: apply damage to the agent so the damage path can be verified. */
@@ -225,6 +244,25 @@ public class SomaMod {
             pushEvent("debug_hurt", (int) amount, null);
             System.out.println("[soma] debug hurt " + before + " -> " + player.getHealth());
         }
+
+        int countHostiles() {
+            try {
+                AABB a = player.getBoundingBox().inflate(16.0);
+                List<Entity> l = level.getEntitiesOfClass(Entity.class, a,
+                    e -> e != player && e.isAlive() && e instanceof Enemy);
+                StringBuilder sb = new StringBuilder();
+                for (Entity e : l) {
+                    Entity tgt = (e instanceof net.minecraft.world.entity.Mob m) ? m.getTarget() : null;
+                    sb.append(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()))
+                      .append("->").append(tgt == player ? "SOMA" : (tgt == null ? "none" : "other"))
+                      .append(' ');
+                }
+                lastMobInfo = sb.toString();
+                return l.size();
+            } catch (Throwable e) { return -1; }
+        }
+
+        String lastMobInfo = "";
 
         int countItems() {
             try {
@@ -284,6 +322,7 @@ public class SomaMod {
                 GameProfile profile = new GameProfile(UUID.fromString("6dded40e-b7fe-3867-86cf-20f080f1c988"), "SOMA");
                 player = new FakePlayer(level, profile) {
                     @Override public boolean isInvulnerableTo(net.minecraft.world.damagesource.DamageSource d) { return false; }
+                    @Override public boolean isInvulnerable() { return false; }
                     @Override public void tick() { /* driven by the agent */ }
                     @Override public boolean isSpectator() { return false; }
                     @Override public boolean isInvisible() { return false; }
@@ -313,6 +352,10 @@ public class SomaMod {
                 player.getAbilities().mayfly = false;
                 player.getAbilities().flying = false;
                 player.getAbilities().invulnerable = false;
+                // Entity.setInvulnerable() is a DIFFERENT flag from Abilities.invulnerable
+                // and it is checked before isInvulnerableTo() -> this is what silently
+                // ate every point of damage
+                player.setInvulnerable(false);
             } catch (Throwable ignored) {}
         }
 
@@ -473,6 +516,12 @@ public class SomaMod {
                 if (player == null) return;
                 if (cleaned < 0) cleanupStands();
                 else if (tickCounter % 600 == 0) cleanupStands(true);
+                // The entity has to tick like a real one: Entity.isRemovedOrRecentlyCreated()
+                // is tickCount == 0, and LivingEntity.hurt() rejects damage on a
+                // "recently created" entity. FakePlayer.tick() is empty, so we drive it.
+                int tcBefore = player.tickCount;
+                try { player.baseTick(); } catch (Throwable ignored) {}
+                if (player.tickCount <= tcBefore) player.tickCount = tcBefore + 1;
                 checkHealth();
                 survivalTick();
                 advanceMining();
@@ -495,15 +544,28 @@ public class SomaMod {
         void survivalTick() {
             if (player == null) return;
             try {
-                // fall damage
+                // fall damage - tracked by hand: Entity.fallDistance only moves in
+                // LivingEntity.travel(), which a FakePlayer never runs
                 if (!player.onGround()) {
-                    fallTrack = Math.max(fallTrack, player.fallDistance);
-                } else if (fallTrack > 3.0) {
-                    float dmg = (float) (fallTrack - 3.0);
-                    player.setHealth(Math.max(0.5f, player.getHealth() - dmg));
-                    pushEvent("fall", (int) Math.round(dmg), null);
-                    fallTrack = 0.0;
+                    if (fallStartY < 0) fallStartY = player.getY();
+                    else fallStartY = Math.max(fallStartY, player.getY());
+                } else if (fallStartY >= 0) {
+                    double drop = fallStartY - player.getY();
+                    fallStartY = -1.0;
+                    if (drop > 3.0) {
+                        float dmg = (float) (drop - 3.0);
+                        player.setHealth(Math.max(0.5f, player.getHealth() - dmg));
+                        pushEvent("fall", (int) Math.round(dmg), null);
+                        System.out.println("[soma] fall damage " + Math.round(dmg));
+                    }
                 }
+
+                // report any health change so we can see where damage comes from
+                float hp = player.getHealth();
+                if (hp < lastHp - 0.01f) {
+                    System.out.println("[soma] hp " + lastHp + " -> " + hp);
+                }
+                lastHp = hp;
 
                 // lava / fire
                 if (player.isInLava()) {

@@ -65,6 +65,13 @@ picks up drops natively. Getting there took four steps:
 Fallback if any of that fails: level.addNewPlayer(player) only (real entity in
 the world, no tab entry).
 
+DAMAGE / DEATH
+  The agent takes real damage: mobs target it (verified: zombie->SOMA), hits land,
+  fall damage is computed by hand (Entity.fallDistance only moves inside
+  LivingEntity.travel()), lava burns, starvation drains, regen heals above 18 food.
+  On death the mod fakes the vanilla death flow (a dead fake player has no client
+  to press the respawn button): inventory restored, food reset, respawn at spawn.
+
 MOVEMENT
 Real locomotion, not teleport: accelerate toward the target, apply friction and
 gravity, then player.move(MoverType.SELF, delta) so collisions, step-up, fall
@@ -117,6 +124,16 @@ BUGS FOUND AND FIXED (do not reintroduce)
      Use the pgrep -x java + ps -p $p -o args= loop.
   7. An entity without health breaks enc; a Double in a %d breaks String.format -
      always count format specifiers against arguments.
+  8. THE BIG ONE: a FakePlayer never ticks, so Entity.tickCount stays 0, and
+     Entity.isRemovedOrRecentlyCreated() is (tickCount == 0). LivingEntity.hurt()
+     rejects ALL damage on a "recently created" entity - mobs happily target the
+     agent, swing at it, and nothing happens. Fix: call player.baseTick() every
+     tick (and bump tickCount if it did not move). Symptoms looked like "the mob
+     pack is not doing damage", the real cause was an entity that was never alive.
+  9. Entity.setInvulnerable() is a different flag from Abilities.invulnerable and
+     is checked first - clear both.
+ 10. placeNewPlayer() reloads the player NBT from disk: give the starter kit
+     AFTER it, otherwise the inventory is wiped.
 
 OPEN / NEXT
   - no goal generator yet, no external world memory, no INT8/INT4 runtime.
