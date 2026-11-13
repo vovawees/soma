@@ -65,6 +65,26 @@ picks up drops natively. Getting there took four steps:
 Fallback if any of that fails: level.addNewPlayer(player) only (real entity in
 the world, no tab entry).
 
+DAMAGE / DEATH (the hardest bug in this project)
+  LivingEntity/Player.hurt() DECLINES the damage for a fake player: the call
+  returns false and the hp does not move. All the obvious flags are clean
+  (abilities.invulnerable=false, entity invulnerable=false, alive, not dying,
+  not removed, removalReason=null, tickCount>0, gamemode=SURVIVAL, inLevel=true,
+  invulnerableTime=0) and there is no infiniteDamage gamerule in 1.21.1.
+  isRemovedOrRecentlyCreated() does not even exist in 1.21.1 - it was a red
+  herring.
+  FIX: SomaPlayer overrides hurt(DamageSource, float): try the vanilla path
+  first, and if it declines, apply the damage by hand (setHealth + hurtTime).
+  Every mob hit and every player hit goes through the override, so the agent is
+  finally damageable.
+  ALSO: LivingEntity.tick() is the only place that ticks down invulnerableTime
+  (the damage cooldown), hurtTime and useItemRemaining - and FakePlayer.tick() is
+  empty. SomaPlayer.tickCounters() does it now. Without it the agent would
+  survive exactly one hit and then be immune (invulnerableTime stays at 10).
+  Also: fake players get no chunk ticket, so their chunk unloads and the entity
+  is removed -> the agent was recreated at spawn every ~3 minutes. The mod now
+  force-loads a 3x3 chunk area around the agent.
+
 DAMAGE / DEATH
   The agent takes real damage: mobs target it (verified: zombie->SOMA), hits land,
   fall damage is computed by hand (Entity.fallDistance only moves inside

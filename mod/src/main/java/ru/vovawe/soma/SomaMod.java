@@ -151,6 +151,49 @@ public class SomaMod {
         @Override public boolean isInvisible() { return false; }
         @Override public boolean canBeSeenAsEnemy() { return isAlive(); }
         public void bumpAttackCooldown() { this.attackStrengthTicker++; }
+
+        /**
+         * LivingEntity/Player.hurt() returns false for this entity for reasons we
+         * cannot see from the outside (the vanilla damage path refuses it), and a
+         * rejected hurt() means mobs and players hit the agent for nothing.
+         * Apply the damage ourselves when the vanilla path declines it, so the
+         * world can actually hurt the agent.
+         */
+        @Override
+        public boolean hurt(net.minecraft.world.damagesource.DamageSource source, float amount) {
+            boolean ok = false;
+            try { ok = super.hurt(source, amount); } catch (Throwable ignored) {}
+            if (!ok && amount > 0.0f && this.getHealth() > 0.0f) {
+                this.setHealth(Math.max(0.0f, this.getHealth() - amount));
+                this.hurtTime = 10;
+                try { this.invulnerableTime = 10; } catch (Throwable ignored) {}
+                System.out.println("[soma] damage applied manually: " + amount
+                    + " hp=" + this.getHealth());
+                return true;
+            }
+            return ok;
+        }
+
+        /**
+         * LivingEntity.tick() is the only place that ticks down the per-entity
+         * timers, and FakePlayer.tick() is empty, so we have to do it ourselves.
+         *
+         * invulnerableTime is the damage cooldown: LivingEntity.hurt() rejects
+         * every hit while it is > 0 unless the damage source bypasses the
+         * cooldown. Without this decrement the agent survives exactly ONE hit
+         * and is then permanently invulnerable - which looks like "the game
+         * refuses to damage the bot".
+         *
+         * useItemRemaining / updateUsingItem() is what makes eating and other
+         * timed item uses actually complete.
+         */
+        public void tickCounters() {
+            if (this.invulnerableTime > 0) this.invulnerableTime--;
+            if (this.hurtTime > 0) this.hurtTime--;
+            if (this.useItemRemaining > 0) {
+                try { this.updateUsingItem(this.getUseItem()); } catch (Throwable ignored) {}
+            }
+        }
     }
 
     // =====================================================================
@@ -279,6 +322,20 @@ public class SomaMod {
         void debugHurt(float amount) {
             if (player == null || level == null) return;
             player.invulnerableTime = 0;
+            System.out.println("[soma] pre-hurt: abilities.invulnerable=" + player.getAbilities().invulnerable
+                + " entityInvulnerable=" + player.isInvulnerable()
+                + " alive=" + player.isAlive()
+                + " dying=" + player.isDeadOrDying()
+                + " removed=" + player.isRemoved()
+                + " removalReason=" + player.getRemovalReason()
+                + " tickCount=" + player.tickCount
+                + " gamemode=" + player.gameMode.getGameModeForPlayer()
+                + " hp=" + player.getHealth() + "/" + player.getMaxHealth()
+                + " invTime=" + player.invulnerableTime
+                + " hurtTime=" + player.hurtTime
+                + " inLevel=" + level.players().contains(player)
+                + " doFireTick=" + level.getGameRules().getBoolean(net.minecraft.world.level.GameRules.RULE_DOFIRETICK)
+                + " fireDamage=" + level.getGameRules().getBoolean(net.minecraft.world.level.GameRules.RULE_FIRE_DAMAGE));
             boolean ok = player.hurt(level.damageSources().generic(), amount);
             System.out.println("[soma] debug hurt ok=" + ok + " hp=" + player.getHealth());
         }
@@ -367,7 +424,42 @@ public class SomaMod {
                 System.out.println("[soma] player ready at " + player.getX() + "," + player.getY()
                     + "," + player.getZ() + " visible=" + playerVisible);
             }
-            if (player != null && player.isRemoved()) { player = null; playerVisible = false; }
+            if (player != null && player.isRemoved()) {
+                System.out.println("[soma] player entity was removed, recreating (hp="
+                    + player.getHealth() + ")");
+                player = null;
+                playerVisible = false;
+            }
+        }
+
+        /** Chunk tickets are normally refreshed by ServerPlayer.tick(); we skip that,
+         *  so the chunk the agent stands in unloads and the entity is removed. */
+        final java.util.Set<Long> forcedChunks = new java.util.HashSet<>();
+
+        void keepChunksLoaded() {
+            try {
+                if (player == null || level == null) return;
+                int cx = player.blockPosition().getX() >> 4;
+                int cz = player.blockPosition().getZ() >> 4;
+                java.util.Set<Long> want = new java.util.HashSet<>();
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        want.add((((long) (cx + dx)) << 32) ^ (cz + dz) & 0xFFFFFFFFL);
+                    }
+                }
+                for (Long k : new java.util.ArrayList<>(forcedChunks)) {
+                    if (!want.contains(k)) {
+                        level.setChunkForced((int) (k >> 32), (int) (k & 0xFFFFFFFFL), false);
+                        forcedChunks.remove(k);
+                    }
+                }
+                for (Long k : want) {
+                    if (!forcedChunks.contains(k)) {
+                        level.setChunkForced((int) (k >> 32), (int) (k & 0xFFFFFFFFL), true);
+                        forcedChunks.add(k);
+                    }
+                }
+            } catch (Throwable ignored) {}
         }
 
         void setSurvival() {
@@ -565,6 +657,8 @@ public class SomaMod {
                 if (player.tickCount <= tcBefore) player.tickCount = tcBefore + 1;
                 try { player.getFoodData().tick(player); } catch (Throwable ignored) {}
                 try { player.bumpAttackCooldown(); } catch (Throwable ignored) {}
+                try { player.tickCounters(); } catch (Throwable ignored) {}
+                keepChunksLoaded();
 
                 survivalTick();
                 handleDeathAndRespawn();
@@ -645,6 +739,7 @@ public class SomaMod {
                 // Track real HP changes (from mobs, projectiles, fire, starvation, etc.)
                 float hp = player.getHealth();
                 if (hp < lastHp - 0.05f) {
+                    System.out.println("[soma] hp " + lastHp + " -> " + hp);
                     float dmg = lastHp - hp;
                     pushEvent("hurt", Math.max(1, Math.round(dmg)), player.blockPosition());
                 }
