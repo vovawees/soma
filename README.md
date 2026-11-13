@@ -62,9 +62,15 @@ Runtime и Training Engine изолированы от игрового пото
 
 | Компонент | Язык | Процесс | Что делает |
 |---|---|---|---|
-| `bot/` | Node 18+, mineflayer | `soma_bot` | транспорт, наблюдение, исполнение действий |
+| `bot/` | Node 18+, mineflayer | `soma_bot` | транспорт для **ванильных** серверов |
+| `mod/` | Java 21, NeoForge 21.1.265 | в процессе MC-сервера | транспорт для **NeoForge**-серверов |
 | `agent/brain.py` | Python 3.9+, numpy | `soma_brain` | инференс, выбор действия, награда, буфер |
 | `agent/trainer.py` | Python 3.9+, numpy | `soma_trainer` | обучение, чекпоинты |
+
+Два адаптера, один мозг: `bot/` и `mod/` говорят на одном и том же JSON-протоколе,
+поэтому `agent/` не знает, кто добыл кадр. `bot/` работает на любом ванильном
+сервиве без установки на сервер; `mod/` нужен там, где сервер отбивает ванильных
+клиентов (NeoForge 21.1 с network negotiation).
 
 Модель — MLP: encoder кадра (3450 → 768 → 192), temporal-окно 6 кадров
 (1152 → 384 → 192), factorized heads: Q по кандидатам, V, aux dynamics.
@@ -123,12 +129,26 @@ float32-вектор, всё относительно игрока и повёр
 - **Публикация** — trainer пишет `model.npz.tmp.<pid>` и делает `os.replace`,
   brain подхватывает по mtime. Полузаписанных весов brain не увидит.
 
+## Сборка мода (NeoForge)
+
+Собрано без Gradle: `mod/build.sh` компилирует против пропатченных классов MC,
+которые уже лежат в `libraries/` самого сервера (плюс `-srg.jar` с Mojang-маппингами).
+
+```bash
+bash mod/build.sh                  # -> mod/build/soma-0.1.0.jar
+cp mod/build/soma-0.1.0.jar <mc-server>/mods/
+bash scripts/deploy_mod.sh         # пересборка + рестарт MC + рестарт мозга
+```
+
+На сервере: `/soma start`, `/soma stop`, `/soma status`.
+
 ## Установка и запуск
 
 ```bash
 cd /home/opc/ai_workspace/soma
 ./scripts/soma.sh setup          # venv + numpy + npm install (один раз)
-./scripts/soma.sh all            # bot + brain + trainer
+./scripts/soma.sh all            # bot + brain + trainer   (ванильный сервер)
+bash  scripts/deploy_mod.sh      # мод + MC + brain        (NeoForge сервер)
 ./scripts/stats.sh               # телеметрия сервера и агента
 ./scripts/soma.sh stop
 ```

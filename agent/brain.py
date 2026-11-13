@@ -58,8 +58,8 @@ class Brain:
                 print('[brain] checkpoint load failed:', e)
         else:
             print(f'[brain] fresh model ({self.net.nparams()/1e6:.2f}M params)')
-            self.net.save(C.CKPT + '.tmp')
-            os.replace(C.CKPT + '.tmp', C.CKPT)
+            self.net.save(C.CKPT + '.tmp.npz')
+            os.replace(C.CKPT + '.tmp.npz', C.CKPT)
             self.model_mtime = os.path.getmtime(C.CKPT)
 
     # ------------------------------------------------------------ helpers --
@@ -77,7 +77,7 @@ class Brain:
         if n == 0:
             return 0
         S = self.net.temporal(window[None, ...])[0]
-        Q = self.net.q_all(S[None, ...], Mx[None, ...])[0][0]
+        Q = self.net.q_all(S, Mx[None, ...])[0][0]
         self.ck = float(np.mean(Q[:n]))
         # epsilon-greedy over admissible candidates
         self.eps = max(0.05, 0.30 * (0.9995 ** self.step_n))
