@@ -48,6 +48,7 @@ class Brain:
         self.step_n = 0
         self.model_mtime = 0.0
         self.log_every = 50
+        self.errors = 0
         self.eps = 0.30
         if os.path.exists(C.CKPT):
             try:
@@ -210,11 +211,19 @@ def main():
             if fr.get('t') != 'obs':
                 continue
 
-            ai = br.on_frame(fr)
             try:
+                ai = br.on_frame(fr)
                 sock.sendall((json.dumps({'t': 'act', 'i': ai}) + '\n').encode())
-            except OSError:
-                pass
+            except Exception as e:
+                # one malformed frame must never take the agent down
+                br.errors += 1
+                print('[brain] frame error:', repr(e))
+                if br.errors % 50 == 1:
+                    print('[brain] error count', br.errors)
+                try:
+                    sock.sendall((json.dumps({'t': 'act', 'i': 0}) + '\n').encode())
+                except OSError:
+                    pass
 
             now = time.time()
             if now - last_reload > 5.0:

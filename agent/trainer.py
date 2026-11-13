@@ -103,7 +103,8 @@ class Trainer:
                 self.log()
 
     def publish(self):
-        tmp = C.CKPT + f'.tmp.{os.getpid()}'
+        # np.savez appends .npz when the name does not already end with it
+        tmp = C.CKPT + f'.tmp.{os.getpid()}.npz'
         self.net.save(tmp)
         os.replace(tmp, C.CKPT)
 

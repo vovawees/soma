@@ -126,10 +126,10 @@ def encode(frame: dict) -> np.ndarray:
         v[base + 3] = np.clip((dx * cy - dz * sy) / 8.0, -1, 1)   # right
         v[base + 4] = np.clip(float(e[3]) / 8.0, -1, 1)           # up
         v[base + 5] = np.clip((dx * sy + dz * cy) / 8.0, -1, 1)   # forward
-        v[base + 6] = np.clip(float(e[5]) / 16.0, 0, 1)           # distance
+        v[base + 6] = np.clip(max(float(e[5]), 0.0) / 16.0, 0, 1)           # distance
         v[base + 7] = np.clip(float(e[6]) / 20.0, 0, 1) if len(e) > 6 and e[6] >= 0 else 0.0
         v[base + 8] = float(e[7]) if len(e) > 7 else 0.0          # hostility class
-        v[base + 9] = 1.0 / (1.0 + float(e[5]))
+        v[base + 9] = 1.0 / (1.0 + max(float(e[5]), 0.0))
     o += C.ENT_TOTAL
 
     # ---- inventory (41 x 4) ----

@@ -10,18 +10,20 @@ TWO ADAPTERS, ONE BRAIN
 bot/    Node + mineflayer, for VANILLA servers. Portable, no server-side install.
 mod/    NeoForge 21.1.265 companion mod, for the user's create-aeronautics server
         (that server rejects vanilla clients, so a mod is the only way in).
-Both speak the exact same newline-delimited JSON schema on TCP, so agent/brain.py
-does not know or care which adapter produced the frame.
+Both speak the same newline-delimited JSON schema on TCP, so agent/brain.py does
+not know or care which adapter produced the frame.
 
 REPO LAYOUT
 soma/
-  bot/              environment adapter (Node). Transport only.
-  mod/              NeoForge mod (Java 21, single file + build.sh).
-  agent/            brain.py, trainer.py, model.py, enc.py, buf.py, reward.py.
-  scripts/soma.sh       bot + brain + trainer lifecycle (tmux soma_*).
-  scripts/deploy_mod.sh build mod -> install -> restart MC -> restart brain.
-  scripts/stats.sh      server + agent telemetry.
-  data/             model.npz, replay.f16, metrics.jsonl, logs (gitignored).
+  bot/                environment adapter (Node). Transport only.
+  mod/                NeoForge mod (Java 21, single file + build.sh).
+  agent/              brain.py, trainer.py, model.py, enc.py, buf.py, reward.py.
+  scripts/soma.sh           bot + brain + trainer lifecycle (tmux soma_*).
+  scripts/deploy_mod.sh     build mod -> install -> restart MC -> restart brain.
+  scripts/reset_training.sh wipe model + replay + metrics (use after a broken
+                           observation/action contract, e.g. a physics change).
+  scripts/stats.sh          server + agent telemetry.
+  data/               model.npz, replay.f16, metrics.jsonl, logs (gitignored).
 
 VPS PATHS / PORTS / SERVICES
 project dir      /home/opc/ai_workspace/soma
@@ -40,11 +42,35 @@ local PC: i5-6500, 4C/4T, AVX2, 15 GB.
 
 BUILD (no Gradle, no ModDevGradle)
 mod/build.sh compiles against the server's own patched MC classes:
-  - classpath = all jars under libraries/ EXCEPT net/minecraft/server/1.21.1*/
+  - classpath = all jars under libraries/ EXCEPT net/minecraft/server/1.21.1*
     (those intermediate jars shadow the mapped classes)
   - plus the -srg.jar (Mojang mappings) from server/1.21.1-20240808.144430/
   - JDK 21 (java-21-openjdk-devel) installed via dnf.
   Output: mod/build/soma-0.1.0.jar -> mods/ + server restart.
+
+FAKE PLAYER (the hard part) — HOW IT IS DONE NOW
+The agent is a REAL ServerPlayer: in the tab list, in the world, mob-targetable,
+picks up drops natively. Getting there took four steps:
+  1. new Connection(PacketFlow.SERVERBOUND) + an EmbeddedChannel. Connection keeps
+     its channel in a private field - find it by TYPE via reflection, not by name.
+  2. Claim every mod channel on that connection: read NetworkRegistry's private
+     PAYLOAD_REGISTRATIONS and put all the ids into ChannelAttributes
+     .COMMON_CHANNELS / ad-hoc channels. Without this NeoForge throws
+     "Payload x may not be sent to the client!" the moment a mod pushes a packet.
+  3. player.connection must be replaced with a ServerGamePacketListenerImpl built
+     on OUR connection BEFORE placeNewPlayer(), otherwise placeNewPlayer touches
+     the FakePlayer's original channel-less listener and NPEs.
+  4. PlayerList.placeNewPlayer(conn, player, cookie) with
+     CommonListenerCookie(profile, 0, ClientInformation.createDefault(), false).
+Fallback if any of that fails: level.addNewPlayer(player) only (real entity in
+the world, no tab entry).
+
+MOVEMENT
+Real locomotion, not teleport: accelerate toward the target, apply friction and
+gravity, then player.move(MoverType.SELF, delta) so collisions, step-up, fall
+distance and step sounds behave like a normal player. setPos() is what made it
+look like a floating armour stand - never use it for locomotion.
+Movement speed ~0.13 blocks/tick (2.6 m/s), jump 0.42.
 
 PROTOCOL (schema v1), one frame -> 3450 float32
   self 32 | grid 512*6 | ent 12*10 | inv 41*4 | ev 10*5 | meta 12
@@ -52,46 +78,50 @@ All relative to the player and rotated into the player's frame (translation and
 rotation invariant). Categorical ids go through FIXED hashed embeddings (4096
 blocks, 2048 items, 1024 entity names) so a 248-mod pack cannot shift the space.
 Candidate = one admissible action; the mod/bot advertises <=48, the brain answers
-with an INDEX. 16 features per candidate (type, distance, direction, class, ...).
+with an INDEX. 16 features per candidate.
 
 MODEL (agent/model.py) — 3,428,097 params, fp32, ~14 MB
   encoder 3450->768->192 | temporal 6*192->384->192
   Q head (192+16)->128->1 per candidate | V head | aux dynamics head
 The encoder is trained ONLY by the auxiliary loss (predict next latent); the RL
 loss uses detached latents. That keeps policy learning cheap and stable.
-Trainer publishes model.npz.tmp.<pid> then os.replace; brain reloads on mtime.
+Trainer publishes model.npz.tmp.<pid>.npz then os.replace; brain reloads on mtime.
 
 REWARD (agent/reward.py), clipped to +-3
   new block type, new item type, new chunk (log-damped novelty), damage, death
   (-3), idle, time cost (-0.005/step), pickups.
 
-STATUS (2026-11-13, verified end to end)
-  MC server: up, stable, no crash since the fake-player fix.
-  Mod: loads, spawns one fake player at spawn (80.5,72,-111.5), serves frames.
-  Brain: connected, ~3.3 frames/s, buffer filling, rewards positive.
-  Measured: agent moved across 4 chunks, mined and picked up 3 item types,
-  reward ~+0.003/step at 240 transitions.
-  RAM: java 7.1 GB (MC, -Xmx8G), brain 120 MB, trainer 96 MB.
-  Server cost: ~18 ms per observation every 300 ms (one rebuild frame out of two
-  is free; grid reads are ~35 us/block on this pack).  ~6% of one core.
+STATUS (2026-11-13 15:28, verified end to end)
+  MC server: up, no crash since 14:28 (the only remaining crash report is old).
+  Agent: REAL player - "There are 1 of a max of 20 players online: SOMA",
+         inTab=true, players=1, errors=0.
+  Brain: ~3.3 frames/s, walking under physics (spawn 80,71,-111 -> 52,70,-127).
+  Observation cost: 2.6 ms per frame (was 18 ms before the chunk cache).
+  Server load from the agent: ~0.9% of one core.
+  Training data was wiped after the physics change (scripts/reset_training.sh) -
+  the old transitions taught the model a world where the agent teleported.
+  Trainer restarted from scratch, waits for 2000 transitions (~10 min).
 
 BUGS FOUND AND FIXED (do not reintroduce)
-  1. Never call level.addNewPlayer() on the fake player. AppleSkin (and similar
-     mods) push packets to players on entity tick; with no real connection that
-     call blocks the server thread forever -> 60 s watchdog crash.
-  2. Never cast Gson numbers blind: (int)(double) o throws ClassCastException.
+  1. Never cast Gson numbers blind: (int)(double) o throws ClassCastException.
      Use ((Number) o).intValue().  This silently broke every mine/use/place.
-  3. The fake player is not ticked, so it never picks up drops. After destroyBlock
-     / attack, collect ItemEntity in a 4-block radius into the inventory.
-  4. ServerLevel.getBlockState resolves and joins a chunk future on every call.
-     At 512 samples that cost 33 ms; go through the cached LevelChunk instead.
-  5. pkill -f user_jvm_args kills the SSH shell itself (its own cmdline matches).
+  2. np.savez appends .npz unless the filename already ends with it - a temp file
+     named model.npz.tmp.123 would be written as model.npz.tmp.123.npz and the
+     os.replace would fail. Always end temp names with .npz.
+  3. Division by zero in enc.py when an entity has no health (hp = -1): always
+     clamp with max(x, 0).
+  4. One malformed frame must never kill the brain - wrap on_frame in try/except.
+  5. ServerLevel.getBlockState resolves and joins a chunk future on every call.
+     Go through the cached LevelChunk (and skip the fallback) - 33 ms -> 2.6 ms.
+  6. pkill -f user_jvm_args kills the SSH shell itself (its own cmdline matches).
      Use the pgrep -x java + ps -p $p -o args= loop.
+  7. An entity without health breaks enc; a Double in a %d breaks String.format -
+     always count format specifiers against arguments.
 
 OPEN / NEXT
-  - grid is the hot spot (35 us/block). Try LevelChunkSection.getState directly
-    (LevelChunkSection.getState(int,int,int) is not accessible in 21.1; needs a
-    different accessor) or drop the window to 6x6x6.
-  - trainer waits for WARMUP=2000 transitions (~10 min at 3.3 Hz), then SGD.
-  - reward weights are uncalibrated; the agent currently favours wandering.
   - no goal generator yet, no external world memory, no INT8/INT4 runtime.
+  - reward weights are uncalibrated; the agent does not yet prefer anything.
+  - the agent still has no pathfinding - goto is a straight line with jump.
+    The pack ships sable_pathfinder 1.4.0 + Sable 2.0.6 (simulated players);
+    worth evaluating as a pathfinding source for 1.21.1 NeoForge.
+  - mob aggro is now possible, but the agent has no combat policy yet.

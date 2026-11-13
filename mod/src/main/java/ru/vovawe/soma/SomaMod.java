@@ -5,7 +5,9 @@ import com.mojang.authlib.GameProfile;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.Connection;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -219,6 +221,8 @@ public class SomaMod {
                     + " seq=" + seq + " actions=" + actionCount
                     + " pos=" + (player == null ? "-" : String.format(Locale.ROOT, "%.0f,%.0f,%.0f", player.getX(), player.getY(), player.getZ()))
                     + " inv=" + (player == null ? 0 : player.getInventory().getItem(0).getCount())
+                    + " players=" + server.getPlayerList().getPlayers().size()
+                    + " inTab=" + server.getPlayerList().getPlayers().contains(player)
                     + " errors=" + errorCount + " lastError=" + lastError.get()), true);
         }
 
@@ -280,21 +284,134 @@ public class SomaMod {
                     public void tick() { /* driven by the agent */ }
                 };
                 player.getAbilities().instabuild = false;
-                player.getAbilities().mayfly = true;
+                player.getAbilities().mayfly = false;
+                player.getAbilities().flying = false;
                 BlockPos spawn = new BlockPos(0, 100, 0);
                 try {
                     spawn = level.getSharedSpawnPos();
                 } catch (Exception ignored) {}
                 player.setPos(spawn.getX() + 0.5, findGroundY(spawn.getX(), spawn.getZ()) + 1.0, spawn.getZ() + 0.5);
-                // NOTE: deliberately NOT calling level.addNewPlayer().
-                // Once the fake player enters the entity tick list, mods that push
-                // packets to players (AppleSkin and friends) block the server
-                // thread forever trying to talk to a connection that does not exist.
-                System.out.println("[soma] fake player created at " + player.getX() + "," + player.getY() + "," + player.getZ());
+                attachToServer();
+                System.out.println("[soma] fake player created at " + player.getX() + "," + player.getY() + "," + player.getZ()
+                    + " visible=" + playerVisible);
             }
             if (player != null && player.isRemoved()) {
                 player = null;
+                playerVisible = false;
             }
+        }
+
+        boolean playerVisible = false;
+        net.minecraft.world.entity.decoration.ArmorStand stand = null;
+
+        /**
+         * A real tab entry needs a working network Connection (PlayerList.players is
+         * private, so placeNewPlayer is the only door, and it needs a live channel).
+         * On this pack any mod that pushes a packet to a player without one throws
+         * NPE inside the entity tick, so we keep the agent as a server-side fake
+         * player and give it a visible armour stand body instead.
+         */
+        void attachToServer() {
+            try {
+                Connection conn = new Connection(PacketFlow.SERVERBOUND);
+                // Connection keeps its channel in a private field; find it by type
+                // instead of by name (survives obfuscation / remapping).
+                io.netty.channel.embedded.EmbeddedChannel ch = new io.netty.channel.embedded.EmbeddedChannel();
+                boolean wired = false;
+                for (java.lang.reflect.Field f : Connection.class.getDeclaredFields()) {
+                    if (io.netty.channel.Channel.class.isAssignableFrom(f.getType())) {
+                        f.setAccessible(true);
+                        f.set(conn, ch);
+                        wired = true;
+                        break;
+                    }
+                }
+                if (!wired) throw new IllegalStateException("no Channel field on Connection");
+                registerAllChannels(conn, ch);
+
+                long t0 = System.nanoTime();
+                net.minecraft.server.network.CommonListenerCookie cookie =
+                    new net.minecraft.server.network.CommonListenerCookie(
+                        player.getGameProfile(), 0,
+                        net.minecraft.server.level.ClientInformation.createDefault(), false);
+                // replace the FakePlayer's own (channel-less) listener FIRST, otherwise
+                // placeNewPlayer touches player.connection and NPEs on the old one
+                player.connection = new net.minecraft.server.network.ServerGamePacketListenerImpl(
+                    server, conn, player, cookie);
+                server.getPlayerList().placeNewPlayer(conn, player, cookie);
+                playerVisible = true;
+                System.out.println("[soma] attached in " + (System.nanoTime() - t0) / 1e6
+                    + "ms -> tab entry + mob aggro + native pickups");
+                return;
+            } catch (Throwable e) {
+                System.out.println("[soma] placeNewPlayer failed (" + e + "), falling back to a world-only player");
+            }
+            // Fallback: real entity in the world (mobs aggro, drops picked up, tracked
+            // by clients) without the tab entry.
+            try {
+                level.addNewPlayer(player);
+                playerVisible = true;
+                System.out.println("[soma] world player registered (no tab entry)");
+            } catch (Throwable e2) {
+                playerVisible = false;
+                System.out.println("[soma] attach failed, staying invisible: " + e2);
+            }
+        }
+
+        /**
+         * NeoForge refuses to send modded payloads to a connection that never
+         * negotiated the channel ("Payload x may not be sent to the client!"), and
+         * the guard throws - inside a tick. Claim every registered channel so the
+         * agent behaves like a fully modded client.
+         */
+        @SuppressWarnings("unchecked")
+        void registerAllChannels(Connection conn, io.netty.channel.embedded.EmbeddedChannel ch) {
+            try {
+                java.util.Set<net.minecraft.resources.ResourceLocation> all = new java.util.HashSet<>();
+                java.lang.reflect.Field f = net.neoforged.neoforge.network.registration.NetworkRegistry.class
+                    .getDeclaredField("PAYLOAD_REGISTRATIONS");
+                f.setAccessible(true);
+                java.util.Map<?, ?> regs = (java.util.Map<?, ?>) f.get(null);
+                for (Object v : regs.values()) {
+                    java.util.Map<?, ?> byId = (java.util.Map<?, ?>) v;
+                    for (Object id : byId.keySet()) {
+                        all.add((net.minecraft.resources.ResourceLocation) id);
+                    }
+                }
+                net.neoforged.neoforge.network.registration.ChannelAttributes
+                    .getOrCreateAdHocChannels(conn).addAll(all);
+                io.netty.util.Attribute<java.util.Map<net.minecraft.network.ConnectionProtocol,
+                    java.util.Set<net.minecraft.resources.ResourceLocation>>> attr =
+                    ch.attr(net.neoforged.neoforge.network.registration.ChannelAttributes.COMMON_CHANNELS);
+                java.util.Map<net.minecraft.network.ConnectionProtocol,
+                    java.util.Set<net.minecraft.resources.ResourceLocation>> m = attr.get();
+                if (m == null) { m = new java.util.HashMap<>(); attr.set(m); }
+                for (net.minecraft.network.ConnectionProtocol proto : net.minecraft.network.ConnectionProtocol.values()) {
+                    m.computeIfAbsent(proto, k -> new java.util.HashSet<>()).addAll(all);
+                }
+                System.out.println("[soma] claimed " + all.size() + " mod channels on the agent connection");
+            } catch (Throwable e) {
+                System.out.println("[soma] channel registration failed: " + e);
+            }
+        }
+
+        void syncStand() {
+            if (player == null) return;
+            try {
+                if (stand == null || stand.isRemoved()) {
+                    stand = new net.minecraft.world.entity.decoration.ArmorStand(
+                        net.minecraft.world.entity.EntityType.ARMOR_STAND, level);
+                    stand.setCustomName(Component.literal("SOMA"));
+                    stand.setCustomNameVisible(true);
+                    stand.setNoGravity(true);
+                    stand.setInvisible(false);
+                    stand.setSilent(true);
+                    stand.setInvulnerable(true);
+                    level.addFreshEntity(stand);
+                }
+                stand.setPos(player.getX(), player.getY(), player.getZ());
+                stand.setYRot(player.getYRot());
+            } catch (Throwable ignored) {}
         }
 
         int findGroundY(int x, int z) {
@@ -323,6 +440,7 @@ public class SomaMod {
                     return;
                 }
                 driveActive();
+                if (!playerVisible) syncStand();
                 sendObservation();
                 pollAndExecute();
             } catch (Throwable e) {
@@ -339,32 +457,39 @@ public class SomaMod {
             double dz = (activeTarget.getZ() + 0.5) - player.getZ();
             double d = Math.sqrt(dx * dx + dz * dz);
             if (d < 0.9) { finish(true, "arrived"); return; }
-            double step = Math.min(0.18, d);
-            double nx = player.getX() + dx / d * step;
-            double nz = player.getZ() + dz / d * step;
-            double ny = player.getY();
+            walkStep(dx, dz);
+            activeTicks++;
+            if (activeTicks > 200) finish(false, "timeout");
+        }
+
+        /**
+         * Vanilla-ish locomotion: accelerate, apply friction and gravity, then move()
+         * so collisions, step-up, fall distance and step sounds all behave normally.
+         * No setPos() - that is what made it look like a floating armour stand.
+         */
+        void walkStep(double dx, double dz) {
+            double dist = Math.sqrt(dx * dx + dz * dz);
+            if (dist < 1e-4) return;
             float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
             player.setYRot(yaw);
             player.setYHeadRot(yaw);
+            player.yBodyRot = yaw;
 
-            AABB box = player.getBoundingBox().move(nx - player.getX(), 0, nz - player.getZ());
-            boolean free = level.noCollision(player, box);
-            if (!free) {
-                // try step up one block
-                AABB up = box.move(0, 1.0, 0);
-                if (level.noCollision(player, up)
-                    && !level.getBlockState(BlockPos.containing(nx, ny, nz)).isAir()) {
-                    player.setPos(nx, ny + 1.0, nz);
-                } else {
-                    activeTicks++;
-                    finish(false, "blocked");
-                    return;
-                }
-            } else {
-                player.setPos(nx, ny, nz);
+            Vec3 d = player.getDeltaMovement();
+            double speed = 0.13;
+            double tx = dx / dist * speed;
+            double tz = dz / dist * speed;
+            double nvx = (d.x + (tx - d.x) * 0.30) * 0.98;
+            double nvz = (d.z + (tz - d.z) * 0.30) * 0.98;
+            double nvy = Math.max(d.y - 0.08, -0.6);
+            player.setDeltaMovement(nvx, nvy, nvz);
+
+            boolean blocked = player.horizontalCollision;
+            if (blocked && player.onGround()) {
+                player.setDeltaMovement(nvx, 0.42, nvz);
+                pushEvent("jump", 0, null);
             }
-            activeTicks++;
-            if (activeTicks > 200) finish(false, "timeout");
+            player.move(net.minecraft.world.entity.MoverType.SELF, player.getDeltaMovement());
         }
 
         void finish(boolean ok, String reason) {
@@ -483,7 +608,7 @@ public class SomaMod {
             int by = (int) Math.floor(pos.y);
             int bz = (int) Math.floor(pos.z);
 
-            long tGrid = 0, tEnt = 0, tInv = 0, tCand = 0, tJson = 0;
+            long tGrid = 0, tEnt = 0, tInv = 0, tCand = 0, tJson = 0, tSelf = 0;
             Map<String, Object> self = new HashMap<>();
             Vec3 v = player.getDeltaMovement();
             self.put("x", pos.x); self.put("y", pos.y); self.put("z", pos.z);
@@ -506,6 +631,7 @@ public class SomaMod {
             self.put("time", level.getDayTime() % 24000);
             self.put("raining", level.isRaining());
             self.put("thunder", level.isThundering());
+            tSelf = System.nanoTime();
 
             // voxel window - rebuilt every other frame, reused in between
             // (512 block reads cost ~18 ms on this pack, half of that is not needed
@@ -532,7 +658,7 @@ public class SomaMod {
                 }
             }
 
-            long tSelf = tGrid = System.nanoTime();
+            tGrid = System.nanoTime();
             // entities
             AABB area = new AABB(bx - 24, by - 24, bz - 24, bx + 24, by + 24, bz + 24);
             List<Entity> ents = new ArrayList<>(level.getEntitiesOfClass(Entity.class, area, e -> e != player && e.isAlive()));
@@ -614,7 +740,7 @@ public class SomaMod {
             frameNanos = System.nanoTime() - t0;
             if (seq % 10 == 0) {
                 System.out.println(String.format(Locale.ROOT,
-                    "[soma] obs #%d self=%.1fms grid=%.1fms ent=%.1fms inv=%.1fms cand=%.1fms total=%.1fms cands=%d fb=%d",
+                    "[soma] obs #%d self=%.1fms grid=%.1fms ent=%.1fms inv=%.1fms cand=%.1fms json=%.1fms total=%.1fms cands=%d fb=%d",
                     seq, (tSelf - t0) / 1e6, (tGrid - tSelf) / 1e6, (tEnt - tGrid) / 1e6, (tInv - tEnt) / 1e6,
                     (tCand - tInv) / 1e6, (tJson - tCand) / 1e6, frameNanos / 1e6, cands.size(), gridFallbacks));
             }
