@@ -576,41 +576,52 @@ public class SomaMod {
 
         void netLoop() {
             while (running.get()) {
+                ServerSocket ss = null;
                 try {
-                    ServerSocket ss = new ServerSocket();
+                    ss = new ServerSocket();
                     ss.setReuseAddress(true);
                     ss.bind(new InetSocketAddress(HOST, PORT));
                     serverSocket = ss;
                     System.out.println("[soma] listening on " + HOST + ":" + PORT);
                     while (running.get()) {
-                        Socket s = ss.accept();
-                        s.setTcpNoDelay(true);
-                        in = new BufferedReader(new InputStreamReader(s.getInputStream()));
-                        out = new PrintWriter(s.getOutputStream(), true);
-                        System.out.println("[soma] brain connected");
-                        lastError.set("connected");
-                        String line;
-                        while (running.get() && (line = in.readLine()) != null) {
-                            line = line.trim();
-                            if (line.isEmpty()) continue;
-                            try {
-                                Map<?, ?> msg = GSON.fromJson(line, Map.class);
-                                Object t = msg.get("t");
-                                Object i = msg.get("i");
-                                if ("act".equals(t) && i instanceof Number) {
-                                    int sq = msg.get("s") instanceof Number ? ((Number) msg.get("s")).intValue() : -1;
-                                    synchronized (incoming) {
-                                        incoming.clear();
-                                        incoming.add(new int[]{((Number) i).intValue(), sq});
+                        Socket s = null;
+                        try {
+                            s = ss.accept();
+                            s.setTcpNoDelay(true);
+                            in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                            out = new PrintWriter(s.getOutputStream(), true);
+                            System.out.println("[soma] brain connected");
+                            lastError.set("connected");
+                            String line;
+                            while (running.get() && (line = in.readLine()) != null) {
+                                line = line.trim();
+                                if (line.isEmpty()) continue;
+                                try {
+                                    Map<?, ?> msg = GSON.fromJson(line, Map.class);
+                                    Object t = msg.get("t");
+                                    Object i = msg.get("i");
+                                    if ("act".equals(t) && i instanceof Number) {
+                                        int sq = msg.get("s") instanceof Number ? ((Number) msg.get("s")).intValue() : -1;
+                                        synchronized (incoming) {
+                                            incoming.clear();
+                                            incoming.add(new int[]{((Number) i).intValue(), sq});
+                                        }
                                     }
-                                }
-                            } catch (Exception e) { errorCount++; }
+                                } catch (Exception e) { errorCount++; }
+                            }
+                        } finally {
+                            out = null;
+                            try { if (in != null) in.close(); } catch (Throwable ignored) {}
+                            try { if (s != null) s.close(); } catch (Throwable ignored) {}
+                            System.out.println("[soma] brain disconnected");
                         }
-                        System.out.println("[soma] brain disconnected");
                     }
                 } catch (Throwable e) {
                     lastError.set(String.valueOf(e));
                     try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                } finally {
+                    try { if (ss != null) ss.close(); } catch (Throwable ignored) {}
+                    if (serverSocket == ss) serverSocket = null;
                 }
             }
         }
