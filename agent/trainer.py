@@ -30,6 +30,7 @@ class Trainer:
         self.rng = np.random.RandomState(11)
         self.steps = 0
         self.cand_idx = np.arange(C.MAX_CAND)[None, :]
+        self._arange_b = np.arange(C.BATCH)
 
     def _lr(self):
         # Cosine annealing with floor
@@ -44,8 +45,8 @@ class Trainer:
         B_ = recs.shape[0]
         X0 = recs['X0'].astype(np.float32)
         X1 = recs['X1'].astype(np.float32)
-        Ls = recs['Ls'].reshape(B_, C.T + 2, C.ENC).astype(np.float32)
-        Ln = recs['Ln'].reshape(B_, C.T + 2, C.ENC).astype(np.float32)
+        Ls = recs['Ls'].reshape(B_, C.TOKENS, C.ENC).astype(np.float32)
+        Ln = recs['Ln'].reshape(B_, C.TOKENS, C.ENC).astype(np.float32)
         Cm = recs['Cm'].reshape(B_, C.MAX_CAND, C.CAND_DIM).astype(np.float32)
         Cn = recs['Cn'].reshape(B_, C.MAX_CAND, C.CAND_DIM).astype(np.float32)
         nc = np.maximum(recs['nc'].astype(np.int64), 1)
@@ -56,13 +57,14 @@ class Trainer:
 
         # Double DQN: select best action with online net, evaluate with target net
         S_next_online = self.net.temporal(Ln, use_target=False)[0]
-        q_next_online = self.net.q_all(S_next_online, Cn, mask=mask_n, use_target=False)[0]
+        q_next_online = self.net.q_all_fast(S_next_online, Cn, mask=mask_n, use_target=False, need_v=False)
         q_next_online_masked = np.where(mask_n > 0, q_next_online, -1e9)
         best_a = np.argmax(q_next_online_masked, axis=1)
 
         S_next_target = self.net.temporal(Ln, use_target=True)[0]
-        q_next_target = self.net.q_all(S_next_target, Cn, mask=mask_n, use_target=True)[0]
-        q_target_sel = q_next_target[np.arange(B_), best_a]
+        q_next_target = self.net.q_all_fast(S_next_target, Cn, mask=mask_n, use_target=True, need_v=True)
+        row_idx = self._arange_b if B_ == C.BATCH else np.arange(B_)
+        q_target_sel = q_next_target[row_idx, best_a]
         q_target_sel = np.where(np.isfinite(q_target_sel), q_target_sel, 0.0).astype(np.float32)
 
         ns = recs['ns'].astype(np.float32) if 'ns' in recs.dtype.names else float(C.N_STEP)

@@ -6,7 +6,7 @@ import numpy as np
 import config as C
 
 HDR_N = 8
-TMP_DIM = (C.T + 2) * C.ENC
+TMP_DIM = C.TOKENS * C.ENC
 
 REC = np.dtype([
     ('X0', '<f2', (C.FRAME_DIM,)),          # frame at decision time t
@@ -61,10 +61,15 @@ class Replay:
             self.hdr[3] = 1000  # max_prio * 1000
             self.hdr.flush()
 
-        # In-memory cache for fast O(batch) PER sampling
-        self._pa_cache = None
+        # 2-level block-sum index for O(B + N/512) PER sampling (BLK = 512)
+        self._blk = 512
+        self._n_blk = (self.n + self._blk - 1) // self._blk
+        self._pa_buf = None
+        self._pa_2d = None
+        self._blk_sums = None
         self._pa_cnt = 0
         self._pa_alpha = -1.0
+        self._writes_since_flush = 0
 
     # ------------------------------------------------------------- writing --
     def append(self, rec: dict):
@@ -87,7 +92,10 @@ class Replay:
         self.prio[i] = np.float32(max_p)
         self.hdr[1] = (i + 1) % self.n
         self.hdr[2] = min(self.n, int(self.hdr[2]) + 1)
-        self.hdr.flush()
+        self._writes_since_flush += 1
+        if self._writes_since_flush >= 64:
+            self.hdr.flush()
+            self._writes_since_flush = 0
 
     @property
     def count(self):
@@ -96,6 +104,25 @@ class Replay:
     @property
     def write_idx(self):
         return int(self.hdr[1])
+
+    def _ensure_pa(self, cnt: int, alpha: float):
+        if self._pa_buf is None or self._pa_alpha != alpha:
+            self._pa_buf = np.zeros(self._n_blk * self._blk, dtype=np.float64)
+            self._pa_2d = self._pa_buf.reshape(self._n_blk, self._blk)
+            self._blk_sums = np.zeros(self._n_blk, dtype=np.float64)
+            p = np.maximum(self.prio[:cnt].astype(np.float64), 1e-4)
+            self._pa_buf[:cnt] = p ** alpha
+            n_blk_active = (cnt + self._blk - 1) // self._blk
+            self._blk_sums[:n_blk_active] = self._pa_2d[:n_blk_active].sum(axis=1)
+            self._pa_cnt = cnt
+            self._pa_alpha = alpha
+        elif cnt > self._pa_cnt:
+            p = np.maximum(self.prio[self._pa_cnt:cnt].astype(np.float64), 1e-4)
+            self._pa_buf[self._pa_cnt:cnt] = p ** alpha
+            b0 = self._pa_cnt // self._blk
+            b1 = (cnt - 1) // self._blk
+            self._blk_sums[b0:b1 + 1] = self._pa_2d[b0:b1 + 1].sum(axis=1)
+            self._pa_cnt = cnt
 
     # ------------------------------------------------------------- reading --
     def sample(self, rng: np.random.RandomState, bs: int, alpha: float = C.PER_ALPHA, beta: float = 0.4):
@@ -108,25 +135,26 @@ class Replay:
             is_w = np.ones(k, dtype=np.float32)
             return self.mm[idx], idx, is_w
 
-        if self._pa_cache is None or self._pa_alpha != alpha or cnt != self._pa_cnt:
-            p = np.maximum(self.prio[:cnt].astype(np.float64), 1e-4)
-            self._pa_cache = p ** alpha
-            self._pa_cnt = cnt
-            self._pa_alpha = alpha
-
-        pa = self._pa_cache
-        cdf = np.cumsum(pa)
-        total = cdf[-1]
+        self._ensure_pa(cnt, alpha)
+        n_blk = (cnt + self._blk - 1) // self._blk
+        blk_cdf = np.cumsum(self._blk_sums[:n_blk])
+        total = blk_cdf[-1]
         if not np.isfinite(total) or total <= 0.0:
             idx = rng.randint(0, cnt, size=k)
             is_w = np.ones(k, dtype=np.float32)
             return self.mm[idx], idx, is_w
 
-        # Stratified sampling across k segments for lower variance
+        # Stratified sampling across k segments via 2-level block-sum tree
         u = (np.arange(k, dtype=np.float64) + rng.rand(k)) * (total / k)
-        idx = np.clip(np.searchsorted(cdf, u, side='right'), 0, cnt - 1)
-        probs = pa[idx] / total
-        weights = (cnt * probs) ** (-beta)
+        blk_idx = np.clip(np.searchsorted(blk_cdf, u, side='right'), 0, n_blk - 1)
+        blk_start = blk_cdf[blk_idx] - self._blk_sums[blk_idx]
+        rem = u - blk_start
+        local_cdf = np.cumsum(self._pa_2d[blk_idx], axis=1)
+        local_idx = np.clip((local_cdf <= rem[:, None]).sum(axis=1), 0, self._blk - 1)
+        idx = np.minimum(blk_idx * self._blk + local_idx, cnt - 1)
+
+        probs = self._pa_buf[idx] / total
+        weights = (cnt * np.maximum(probs, 1e-12)) ** (-beta)
         weights /= np.maximum(weights.max(), 1e-8)
         return self.mm[idx], idx, weights.astype(np.float32)
 
@@ -135,11 +163,13 @@ class Replay:
             return
         new_p = np.clip(np.abs(td_errors) + 1e-3, 1e-3, 50.0).astype(np.float32)
         self.prio[idx] = new_p
-        if self._pa_cache is not None and self._pa_alpha > 0.0:
+        if self._pa_buf is not None and self._pa_alpha > 0.0:
             valid = idx < self._pa_cnt
             if np.any(valid):
                 vi = idx[valid]
-                self._pa_cache[vi] = new_p[valid].astype(np.float64) ** self._pa_alpha
+                self._pa_buf[vi] = new_p[valid].astype(np.float64) ** self._pa_alpha
+                dirty_blks = np.unique(vi // self._blk)
+                self._blk_sums[dirty_blks] = self._pa_2d[dirty_blks].sum(axis=1)
         cur_max = float(self.hdr[3]) / 1000.0
         m = float(new_p.max())
         if m > cur_max:

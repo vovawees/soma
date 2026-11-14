@@ -40,6 +40,10 @@ def fake_frame(seq=0, px=100.0, py=64.0, pz=-200.0, yaw=45.0, hp=20.0, food=20.0
             'armor': 4.0, 'atk_cd': 1.0, 'near_craft': True, 'near_furnace': False,
             'sel_slot': 0, 'has_food': True, 'has_tool': True, 'has_weapon': True,
             'has_blocks': True, 'is_night': False,
+            'sky': True, 'shelter': 0.4, 'debuff': False, 'buff_prot': False,
+            'buff_atk': True, 'climb': False, 'has_bow': True, 'has_shield': True,
+            'lava_near': 0.0, 'cliff_ahead': False, 'inv_free': 0.85, 'xp': 5,
+            'ray_ent': True, 'ray_blk': True,
         },
         'grid': {'ox': int(px) - 3, 'oy': int(py) - 2, 'oz': int(pz) - 3, 'step': 1, 'n': 8, 'ids': ids, 'flags': flags},
         'ent': [
@@ -53,6 +57,8 @@ def fake_frame(seq=0, px=100.0, py=64.0, pz=-200.0, yaw=45.0, hp=20.0, food=20.0
             {'a': 'goto', 'x': 104, 'y': 64, 'z': -202, 'd': 4.0},
             {'a': 'craft', 'n': 'minecraft:stone_pickaxe', 'd': 0.0, 'val': 0.8},
             {'a': 'attack', 'eid': 7, 'n': 'minecraft:zombie', 'h': 1, 'tgt': 1, 'd': 1.44},
+            {'a': 'shoot', 'eid': 7, 'n': 'minecraft:zombie', 'h': 1, 'd': 8.0, 'val': 0.9},
+            {'a': 'pillar', 'd': 0.0, 'val': 0.35},
             {'a': 'wait', 'd': 0.0},
         ],
         'ev': [{'e': 'dig', 'm': 1, 'x': 102, 'y': 63, 'z': -201, 'n': 'minecraft:stone'}],
@@ -72,11 +78,11 @@ def main():
     x2 = enc.encode(fake_frame(px=1000.0, pz=-3000.0, yaw=120.0))
     check('translation invariance of grid', abs(float(x[C.SELF_DIM:C.SELF_DIM + 120].sum()) - float(x2[C.SELF_DIM:C.SELF_DIM + 120].sum())) < 1e-4)
 
-    print('== 2. model (Dueling Double-DQN + RMSNorm) ==')
+    print('== 2. model (Transformer + SwiGLU + World-Model) ==')
     net = M.Net(seed=3)
     n = net.nparams()
-    check('param budget 2-6M', 2_000_000 < n < 6_000_000, n)
-    L = net.embed(x[None, :])[0]
+    check('param budget 1-6M', 1_000_000 < n < 6_000_000, n)
+    L = net.infer_embed(x[None, :])
     check('latent shape', L.shape == (1, C.ENC), L.shape)
 
     print('== 3. training step & convergence ==')
@@ -84,7 +90,7 @@ def main():
     B_ = 16
     X0 = np.stack([enc.encode(fake_frame(seq=i, px=100.0 + i)) for i in range(B_)]).astype(np.float32)
     X1 = np.stack([enc.encode(fake_frame(seq=i + 1, px=100.0 + i)) for i in range(B_)]).astype(np.float32)
-    Ls = np.repeat(net.infer_embed(X0)[:, None, :], C.T + 2, axis=1).astype(np.float32)
+    Ls = np.repeat(net.infer_embed(X0)[:, None, :], C.TOKENS, axis=1).astype(np.float32)
     Cm = np.zeros((B_, C.MAX_CAND, C.CAND_DIM), dtype=np.float32)
     c0, _ = enc.encode_candidates(fr['cand'], fr)
     Cm[:] = c0[None, :, :]
@@ -140,10 +146,24 @@ def main():
             os.remove(f)
     br = BR.Brain()
     for step in range(10):
-        ai = br.on_frame(fake_frame(seq=100 + step, px=100.0 + step * 0.5))
-        check(f'brain seq={100+step} valid ai', 0 <= ai < 5) if step == 9 else None
+        fr_step = fake_frame(seq=100 + step, px=100.0 + step * 0.5)
+        ai = br.on_frame(fr_step)
+        check(f'brain seq={100+step} valid ai', 0 <= ai < len(fr_step['cand']), ai) if step == 9 else None
     check('brain frame_seq updated', br.frame_seq == 109, br.frame_seq)
     check('nstep flushed to replay', br.buf.count >= 5, br.buf.count)
+
+    # Test multiplayer chat_ping, give candidate, and social cooldown
+    fr_soc = fake_frame(seq=200)
+    fr_soc['self']['chat_ping'] = True
+    x_soc = enc.encode(fr_soc)
+    check('chat_ping encoded at self[62]', x_soc[62] == 1.0, x_soc[62])
+    give_cand = {'a': 'give', 'eid': 9, 'n': 'minecraft:bread', 'd': 2.0, 'player': 1, 'val': 0.65}
+    g_feat = enc.candidate_features(give_cand, fr_soc)
+    g_mat, g_n = enc.encode_candidates([give_cand], fr_soc)
+    check('give candidate slot 14 & player=1', g_feat[14] == 1.0 and g_feat[22] == 1.0 and np.allclose(g_feat, g_mat[0]))
+    r_soc1, inf_soc1 = rw.step(fr_soc, fr_soc, [{'e': 'interact', 'm': 2, 'n': 'give'}])
+    r_soc2, inf_soc2 = rw.step(fr_soc, fr_soc, [{'e': 'interact', 'm': 2, 'n': 'give'}])
+    check('social reward cooldown works', 'social' in inf_soc1 and 'social' not in inf_soc2 and r_soc1 > r_soc2)
 
     print()
     if FAILS:

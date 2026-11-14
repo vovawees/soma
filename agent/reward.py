@@ -61,6 +61,7 @@ class Reward:
         self.episode = 0
         self.last_pos = None
         self.last_time = 0.0
+        self.last_social_step = -100
         if state:
             self.load(state)
 
@@ -163,11 +164,34 @@ class Reward:
                     r -= 0.20
                 else:
                     r += EVT['attack']
+                    if any(len(en) >= 9 and int(en[8]) == 2 and float(en[5]) < 8.0 for en in (cur.get('ent') or [])):
+                        r += 0.08  # defending a nearby player
 
             elif name == 'kill':
                 self.kills += 1
                 info['kill'] = 1
                 r += EVT['kill']
+                if any(len(en) >= 9 and int(en[8]) == 2 and float(en[5]) < 8.0 for en in (cur.get('ent') or [])):
+                    r += 0.30
+
+            elif name == 'interact':
+                if self.steps - self.last_social_step >= 80:
+                    r += 0.28 if mag >= 2 else 0.18
+                    self.last_social_step = self.steps
+                    info['social'] = ename or 'interact'
+                else:
+                    r += 0.01
+
+            elif name == 'place':
+                low = ename.lower()
+                if any(k in low for k in ('crafting_table', 'furnace', 'chest', 'barrel', 'bed', 'anvil')):
+                    r += 0.35
+                elif 'torch' in low or 'lantern' in low:
+                    r += 0.25 if float(s.get('light', 15.0)) < 7.0 else 0.04
+                elif s.get('is_night') or any(len(en) >= 9 and int(en[8]) == 1 for en in (cur.get('ent') or [])):
+                    r += 0.14   # shelter / defensive wall building
+                else:
+                    r += EVT['place']
 
             elif name == 'fall':
                 r += EVT['fall'] * min(max(mag, 1.0), 15.0)
@@ -228,9 +252,12 @@ class Reward:
         if self.idle > 20:
             r -= 0.03
 
-        # --- social / player proximity (future player interaction) ---
+        # --- social / player proximity (friendly players only) ---
         for e in (cur.get('ent') or []):
             if len(e) >= 9 and int(e[8]) == 2:  # role == 2 (Player)
+                tgt_me = float(e[9]) if len(e) >= 10 else 0.0
+                if tgt_me > 0.0:
+                    continue
                 dist = float(e[5])
                 if 1.5 <= dist <= 6.0 and not (chosen_cand and chosen_cand.get('a') == 'attack'):
                     r += 0.015
